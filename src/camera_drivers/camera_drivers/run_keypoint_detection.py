@@ -184,6 +184,31 @@ class TAPNextManualKeypointDepthPointCloudNode(Node):
     def preprocess_frame(self, frame_rgb):
         cropped_rgb, resized_rgb, crop_info = self.crop_and_downscale(frame_rgb)
 
+        # --------------------------------------------------
+        # NEW: image preprocessing for stable keypoints
+        # --------------------------------------------------
+
+        # 1. Slight blur (reduces high-frequency noise)
+        resized_rgb = cv.GaussianBlur(resized_rgb, (5, 5), 0)
+
+        # 2. CLAHE contrast normalization (very important)
+        lab = cv.cvtColor(resized_rgb, cv.COLOR_RGB2LAB)
+        l, a, b = cv.split(lab)
+
+        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+
+        resized_rgb = cv.merge((l, a, b))
+        resized_rgb = cv.cvtColor(resized_rgb, cv.COLOR_LAB2RGB)
+
+        # 3. Optional sharpening (helps rope edges)
+        kernel = np.array([[0, -1, 0],
+                        [-1, 5, -1],
+                        [0, -1, 0]])
+        resized_rgb = cv.filter2D(resized_rgb, -1, kernel)
+
+        # --------------------------------------------------
+
         video_np = resized_rgb[None, None].astype(np.float32)
         video = torch.from_numpy(video_np)
         video = (video / 255.0) * 2.0 - 1.0
@@ -329,17 +354,36 @@ class TAPNextManualKeypointDepthPointCloudNode(Node):
                 depths_m.append(np.nan)
                 continue
 
-            d = cropped_depth[y, x]
+            # ---------------------------------------
+            # NEW: 3x3 neighborhood min depth sampling
+            # ---------------------------------------
+            x0 = max(0, x - 1)
+            x1 = min(w, x + 2)
+            y0 = max(0, y - 1)
+            y1 = min(h, y + 2)
+
+            patch = cropped_depth[y0:y1, x0:x1]
+
+            if patch.size == 0:
+                depths_m.append(np.nan)
+                continue
 
             if cropped_depth.dtype == np.uint16:
-                d_m = float(d) * 0.001
+                patch_m = patch.astype(np.float32) * 0.001
             else:
-                d_m = float(d)
+                patch_m = patch.astype(np.float32)
 
-            if not np.isfinite(d_m) or d_m <= 0.0:
-                d_m = np.nan
+            # Remove invalid values
+            valid = np.isfinite(patch_m) & (patch_m > 0.0)
 
+            if not np.any(valid):
+                depths_m.append(np.nan)
+                continue
+
+            # Take minimum valid depth (closest point)
+            d_m = np.min(patch_m[valid])
             depths_m.append(d_m)
+            # ---------------------------------------
 
         return np.asarray(depths_m, dtype=np.float32)
 

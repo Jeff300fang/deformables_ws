@@ -35,6 +35,7 @@ class PointCloudSplineFitter(Node):
 
         self.get_logger().info(f"Subscribed to: {self.input_topic}")
         self.get_logger().info(f"Publishing spline to: {self.output_topic}")
+        self.max_distance = 3.0
 
     def pointcloud_to_numpy(self, msg: PointCloud2):
         pts = []
@@ -75,31 +76,28 @@ class PointCloudSplineFitter(Node):
 
         return points[order]
 
+
     def fit_spline(self, points):
         """
-        Fit a 3D parametric spline.
+        Fit a smooth 3D spline that respects the given keypoint order.
 
-        Returns:
-          spline_points: (M, 3)
+        The order of points is assumed to already be the rope order.
+        Smoothness is controlled by self.smoothing.
+        Larger self.smoothing => smoother curve, less exact interpolation.
         """
+        points = np.asarray(points, dtype=np.float32)
         n = points.shape[0]
 
         if n < 2:
             return points
 
-        if n == 2:
-            # Linear interpolation fallback
-            t = np.linspace(0.0, 1.0, self.num_spline_points)
-            spline = (1.0 - t[:, None]) * points[0] + t[:, None] * points[1]
-            return spline.astype(np.float32)
-
-        # Remove duplicate or near-duplicate points
-        unique_points = [points[0]]
+        # Remove consecutive duplicate / near-duplicate points while preserving order.
+        filtered = [points[0]]
         for p in points[1:]:
-            if np.linalg.norm(p - unique_points[-1]) > 1e-6:
-                unique_points.append(p)
+            if np.linalg.norm(p - filtered[-1]) > 1e-5:
+                filtered.append(p)
 
-        points = np.asarray(unique_points, dtype=np.float32)
+        points = np.asarray(filtered, dtype=np.float32)
         n = points.shape[0]
 
         if n < 2:
@@ -110,11 +108,26 @@ class PointCloudSplineFitter(Node):
             spline = (1.0 - t[:, None]) * points[0] + t[:, None] * points[1]
             return spline.astype(np.float32)
 
+        # Chord-length parameterization.
+        # This makes the spline follow the ordered keypoints spatially instead of
+        # treating every keypoint as equally spaced.
+        seg_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        u = np.zeros(n, dtype=np.float32)
+        u[1:] = np.cumsum(seg_lengths)
+
+        total_len = u[-1]
+        if total_len < 1e-6:
+            return points
+
+        u = u / total_len
+
+        # Cubic if enough points, otherwise lower-order.
         k = min(3, n - 1)
 
         try:
             tck, _ = splprep(
                 [points[:, 0], points[:, 1], points[:, 2]],
+                u=u,
                 s=self.smoothing,
                 k=k,
             )
@@ -122,16 +135,23 @@ class PointCloudSplineFitter(Node):
             u_new = np.linspace(0.0, 1.0, self.num_spline_points)
             x_new, y_new, z_new = splev(u_new, tck)
 
-            spline_points = np.stack(
-                [x_new, y_new, z_new],
-                axis=1,
-            )
-
+            spline_points = np.stack([x_new, y_new, z_new], axis=1)
             return spline_points.astype(np.float32)
 
         except Exception as e:
             self.get_logger().warn(f"Spline fit failed, using raw points: {e}")
             return points.astype(np.float32)
+
+    def filter_points_by_distance(self, points):
+        """
+        Keep only points within max_distance from the sensor origin.
+        """
+        if points.shape[0] == 0:
+            return points
+
+        dists = np.linalg.norm(points, axis=1)
+        mask = dists <= self.max_distance
+        return points[mask]
 
     def pointcloud_callback(self, msg: PointCloud2):
         points = self.pointcloud_to_numpy(msg)
@@ -140,7 +160,22 @@ class PointCloudSplineFitter(Node):
             self.get_logger().warn("Received empty point cloud")
             return
 
-        ordered_points = self.sort_points_for_rope(points)
+        points = self.filter_points_by_distance(points)
+
+        if points.shape[0] == 0:
+            self.get_logger().warn(f"All points filtered out (>{self.max_distance:.2f}m)")
+            return
+
+        # IMPORTANT:
+        # Do not PCA-sort. The points are already ordered by keypoint index.
+        ordered_points = points
+
+        # ordered_points = self.filter_bad_neighbor_jumps(ordered_points)
+
+        if ordered_points.shape[0] < 2:
+            self.get_logger().warn("Too few ordered points after filtering")
+            return
+
         spline_points = self.fit_spline(ordered_points)
 
         out_msg = pc2.create_cloud_xyz32(
@@ -151,7 +186,8 @@ class PointCloudSplineFitter(Node):
         self.pub.publish(out_msg)
 
         self.get_logger().info(
-            f"Input points: {points.shape[0]}, spline points: {spline_points.shape[0]}"
+            f"Filtered ordered points: {ordered_points.shape[0]}, "
+            f"spline points: {spline_points.shape[0]}"
         )
 
 
