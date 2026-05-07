@@ -5,13 +5,31 @@ import numpy as np
 import torch
 import rclpy
 import json
+import sys
 
+from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
+from PIL import Image as PILImage
+
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, CompressedImage
 from cv_bridge import CvBridge
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 import sensor_msgs_py.point_cloud2 as pc2
+
+from skimage.morphology import skeletonize
+
+for workspace_root in [Path.cwd(), *Path(__file__).resolve().parents]:
+    for src_dir in (workspace_root, workspace_root / "src"):
+        for local_package in ("sam3", "tapnet"):
+            local_package_path = src_dir / local_package
+            if local_package_path.exists() and str(local_package_path) not in sys.path:
+                sys.path.insert(0, str(local_package_path))
+
+from sam3.model_builder import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
 
 from tapnet.tapnext.tapnext_torch import TAPNext
 
@@ -91,33 +109,25 @@ class TwoCameraTAPNextFusionNode(Node):
             10,
         )
 
-        # --------------------------------------------------
-        # Manual live-tunable transform parameters
-        # Units:
-        #   tx, ty, tz: meters
-        #   roll, pitch, yaw: radians
-        # --------------------------------------------------
         self.declare_parameter("cam2_tx", -0.25)
         self.declare_parameter("cam2_ty", 0.1)
         self.declare_parameter("cam2_tz", 1.44)
         self.declare_parameter("cam2_roll", 3.14)
         self.declare_parameter("cam2_pitch", -0.55)
         self.declare_parameter("cam2_yaw", -0.15)
-
-        # If true, manual transform is applied after calibration:
-        #     T_total = T_manual @ T_calib
-        #
-        # If false, manual transform completely replaces calibration:
-        #     T_total = T_manual
         self.declare_parameter("use_calibration_base", True)
+        self.declare_parameter(
+            "sam_checkpoint_path",
+            "/home/jeffreyfang/deformables/src/sam3/checkpoint/sam3.pt",
+        )
+        self.declare_parameter("sam_prompt", "rope")
+        self.declare_parameter("sam_confidence_threshold", 0.35)
+        self.declare_parameter("num_query_points", 20)
+        self.declare_parameter("visualize_sam_keypoints", False)
 
-        # Optional calibration
         self.calib_path = "/home/jeffreyfang/calib/dataset/calibration.json"
         self.T_cam2_to_cam1_calib = load_cam2_to_cam1(self.calib_path)
         self.T_cam1_to_cam1 = np.eye(4, dtype=np.float64)
-
-        # TAPNext
-        self.ckpt_path = "/home/jeffreyfang/deformables/src/tapnet/checkpoints/tapnextpp_ckpt.pt"
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -128,12 +138,46 @@ class TwoCameraTAPNextFusionNode(Node):
 
         self.get_logger().info(f"Using device: {self.device}")
 
+        # -----------------------------
+        # TAPNext
+        # -----------------------------
+        self.ckpt_path = "/home/jeffreyfang/deformables/src/tapnet/checkpoints/tapnextpp_ckpt.pt"
+
         self.model = TAPNext(image_size=CKPT_SIZE)
         ckpt = torch.load(self.ckpt_path, map_location="cpu")
         self.model.load_state_dict(
             {k.replace("tapnext.", ""): v for k, v in ckpt["state_dict"].items()}
         )
         self.model = self.model.to(self.device).eval()
+
+        # -----------------------------
+        # SAM image model
+        # -----------------------------
+        self.get_logger().info("Loading SAM image processor...")
+
+        self.sam_checkpoint_path = str(self.get_parameter("sam_checkpoint_path").value)
+        self.sam_prompt = str(self.get_parameter("sam_prompt").value)
+        self.sam_confidence_threshold = float(
+            self.get_parameter("sam_confidence_threshold").value
+        )
+        self.num_query_points = int(self.get_parameter("num_query_points").value)
+        self.visualize_sam_keypoints = bool(
+            self.get_parameter("visualize_sam_keypoints").value
+        )
+
+        sam_model = build_sam3_image_model(
+            checkpoint_path=self.sam_checkpoint_path,
+            device=str(self.device),
+        )
+
+        self.sam_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        sam_model = sam_model.eval()
+
+        self.sam_processor = Sam3Processor(
+            sam_model,
+            device=str(self.device),
+            confidence_threshold=self.sam_confidence_threshold,
+        )
 
         self.bridge = CvBridge()
 
@@ -168,12 +212,11 @@ class TwoCameraTAPNextFusionNode(Node):
             10,
         )
 
-        self.get_logger().info("Two-camera TAPNext fusion node started.")
+        self.get_logger().info("Two-camera SAM + TAPNext fusion node started.")
         self.get_logger().info(f"Publishing cam1 cloud to {self.cam1_pointcloud_topic}")
         self.get_logger().info(f"Publishing cam2 cloud to {self.cam2_pointcloud_topic}")
         self.get_logger().info(f"Publishing combined cloud to {self.pointcloud_topic}")
         self.get_logger().info(f"Global frame: {self.global_frame}")
-        self.get_logger().info("Tune live with: ros2 param set /two_camera_tapnext_fusion_node cam2_tx 0.1")
 
     def camera_info_callback(self, msg: CameraInfo, cam: CameraState):
         cam.fx = float(msg.k[0])
@@ -293,74 +336,245 @@ class TwoCameraTAPNextFusionNode(Node):
 
         return cropped_rgb, resized_rgb, video, crop_info
 
-    def select_query_points_manual(self, frame_rgb, cam_name):
-        frame_bgr = cv.cvtColor(frame_rgb, cv.COLOR_RGB2BGR)
-        display = frame_bgr.copy()
-        points_xy = []
+    def select_query_points_sam(self, cropped_rgb, cam_name):
+        try:
+            image = PILImage.fromarray(cropped_rgb)
 
-        window_name = f"Select TAPNext query points: {cam_name}"
+            if self.device.type == "cuda":
+                autocast_context = torch.autocast(
+                    device_type="cuda",
+                    dtype=self.sam_dtype,
+                )
+            else:
+                autocast_context = nullcontext()
 
-        def redraw():
-            nonlocal display
-            display = frame_bgr.copy()
-
-            for i, (x, y) in enumerate(points_xy):
-                cv.circle(display, (x, y), 5, (0, 255, 0), -1)
-                cv.putText(
-                    display,
-                    str(i),
-                    (x + 6, y - 6),
-                    cv.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (255, 255, 255),
-                    1,
+            with torch.inference_mode(), autocast_context:
+                sam_state = self.sam_processor.set_image(image)
+                sam_state = self.sam_processor.set_text_prompt(
+                    prompt=self.sam_prompt,
+                    state=sam_state,
                 )
 
-            cv.putText(
-                display,
-                f"{cam_name}: click rope keypoints | u undo | c/Enter confirm",
-                (20, 30),
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 255),
-                2,
+            masks = sam_state.get("masks")
+            scores = sam_state.get("scores")
+
+            if masks is None or len(masks) == 0:
+                self.get_logger().warn(f"{cam_name}: SAM returned no masks")
+                return None
+
+            if torch.is_tensor(masks):
+                masks_np = masks.detach().to(dtype=torch.bool).cpu().numpy()
+            else:
+                masks_np = np.asarray(masks)
+
+            if torch.is_tensor(scores):
+                scores_np = scores.detach().to(dtype=torch.float32).cpu().numpy()
+            elif scores is None:
+                scores_np = None
+            else:
+                scores_np = np.asarray(scores)
+
+            if masks_np.shape[0] == 0:
+                self.get_logger().warn(f"{cam_name}: SAM returned no masks")
+                return None
+
+            if scores_np is not None and scores_np.shape[0] == masks_np.shape[0]:
+                mask_idx = int(np.argmax(scores_np))
+            else:
+                flattened = masks_np.reshape(masks_np.shape[0], -1)
+                mask_idx = int(np.argmax(np.sum(flattened > 0, axis=1)))
+
+            mask = masks_np[mask_idx]
+
+            if torch.is_tensor(mask):
+                mask = mask.detach().cpu().numpy()
+
+            mask = np.asarray(mask)
+
+            if mask.ndim > 2:
+                mask = np.squeeze(mask)
+
+            binary_mask = mask > 0.0
+
+            if np.sum(binary_mask) < 20:
+                self.get_logger().warn(f"{cam_name}: SAM rope mask too small")
+                return None
+
+            skeleton = skeletonize(binary_mask)
+
+            ordered = self.order_skeleton_points_graph(skeleton)
+
+            if ordered.shape[0] < 2:
+                self.get_logger().warn(f"{cam_name}: ordered skeleton too small")
+                return None
+
+            if ordered.shape[0] <= self.num_query_points:
+                keypoints_xy = ordered
+            else:
+                idx = np.linspace(
+                    0,
+                    ordered.shape[0] - 1,
+                    self.num_query_points,
+                ).astype(np.int32)
+                keypoints_xy = ordered[idx]
+
+            query_points = np.zeros((keypoints_xy.shape[0], 3), dtype=np.float32)
+            query_points[:, 0] = 0.0
+            query_points[:, 1] = keypoints_xy[:, 1]
+            query_points[:, 2] = keypoints_xy[:, 0]
+
+            if self.visualize_sam_keypoints:
+                self.visualize_selected_sam_keypoints(
+                    cropped_rgb=cropped_rgb,
+                    binary_mask=binary_mask,
+                    skeleton=skeleton,
+                    keypoints_xy=keypoints_xy,
+                    cam_name=cam_name,
+                )
+
+            self.get_logger().info(
+                f"{cam_name}: SAM selected {query_points.shape[0]} query points"
             )
 
-        def mouse_callback(event, x, y, flags, param):
-            if event == cv.EVENT_LBUTTONDOWN:
-                points_xy.append((x, y))
-                redraw()
+            return query_points
 
-        cv.namedWindow(window_name, cv.WINDOW_NORMAL)
-        cv.setMouseCallback(window_name, mouse_callback)
-
-        redraw()
-
-        while rclpy.ok():
-            cv.imshow(window_name, display)
-            key = cv.waitKey(20) & 0xFF
-
-            if key == ord("u"):
-                if points_xy:
-                    points_xy.pop()
-                    redraw()
-            elif key in (ord("c"), 13):
-                break
-            elif key in (ord("q"), 27):
-                points_xy = []
-                break
-
-        cv.destroyWindow(window_name)
-
-        if len(points_xy) == 0:
+        except Exception as e:
+            self.get_logger().error(f"{cam_name}: SAM keypoint selection failed: {e}")
             return None
 
-        query_points = np.zeros((len(points_xy), 3), dtype=np.float32)
-        query_points[:, 0] = 0.0
-        query_points[:, 1] = np.array([p[1] for p in points_xy], dtype=np.float32)
-        query_points[:, 2] = np.array([p[0] for p in points_xy], dtype=np.float32)
+    def order_skeleton_points_graph(self, skeleton):
+        ys, xs = np.where(skeleton)
 
-        return query_points
+        if len(xs) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+
+        nodes = set((int(x), int(y)) for x, y in zip(xs, ys))
+
+        if len(nodes) <= 2:
+            return np.asarray(list(nodes), dtype=np.float32)
+
+        def get_neighbors(p, valid_nodes):
+            x, y = p
+            out = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+
+                    q = (x + dx, y + dy)
+
+                    if q in valid_nodes:
+                        out.append(q)
+
+            return out
+
+        visited = set()
+        components = []
+
+        for node in nodes:
+            if node in visited:
+                continue
+
+            q = deque([node])
+            visited.add(node)
+            comp = []
+
+            while q:
+                p = q.popleft()
+                comp.append(p)
+
+                for nb in get_neighbors(p, nodes):
+                    if nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+
+            components.append(comp)
+
+        largest_component = max(components, key=len)
+        nodes = set(largest_component)
+
+        degrees = {
+            p: len(get_neighbors(p, nodes))
+            for p in nodes
+        }
+
+        endpoints = [p for p, d in degrees.items() if d == 1]
+
+        def bfs_farthest(start):
+            q = deque([start])
+            parent = {start: None}
+            dist = {start: 0}
+            farthest = start
+
+            while q:
+                p = q.popleft()
+
+                if dist[p] > dist[farthest]:
+                    farthest = p
+
+                for nb in get_neighbors(p, nodes):
+                    if nb not in parent:
+                        parent[nb] = p
+                        dist[nb] = dist[p] + 1
+                        q.append(nb)
+
+            return farthest, parent, dist
+
+        if len(endpoints) >= 2:
+            start = endpoints[0]
+        else:
+            start = next(iter(nodes))
+
+        a, _, _ = bfs_farthest(start)
+        b, parent, _ = bfs_farthest(a)
+
+        path = []
+        cur = b
+
+        while cur is not None:
+            path.append(cur)
+            cur = parent[cur]
+
+        path = path[::-1]
+
+        return np.asarray(path, dtype=np.float32)
+
+    def visualize_selected_sam_keypoints(
+        self,
+        cropped_rgb,
+        binary_mask,
+        skeleton,
+        keypoints_xy,
+        cam_name,
+    ):
+        vis = cropped_rgb.copy()
+
+        mask_overlay = np.zeros_like(vis)
+        mask_overlay[:, :, 2] = (binary_mask.astype(np.uint8) * 255)
+
+        vis = cv.addWeighted(vis, 0.75, mask_overlay, 0.25, 0.0)
+
+        ys, xs = np.where(skeleton)
+        for x, y in zip(xs, ys):
+            cv.circle(vis, (int(x), int(y)), 1, (0, 255, 255), -1)
+
+        for i, (x, y) in enumerate(keypoints_xy.astype(np.int32)):
+            cv.circle(vis, (int(x), int(y)), 5, (255, 0, 0), -1)
+            cv.putText(
+                vis,
+                str(i),
+                (int(x) + 6, int(y) - 6),
+                cv.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+            )
+
+        cv.imshow(
+            f"SAM selected keypoints: {cam_name}",
+            cv.cvtColor(vis, cv.COLOR_RGB2BGR),
+        )
+        cv.waitKey(1)
 
     def initialize_tracker(self, cam: CameraState, video, crop_h):
         model_h, model_w = CKPT_SIZE
@@ -500,13 +714,13 @@ class TwoCameraTAPNextFusionNode(Node):
 
         if not cam.initialized:
             self.get_logger().info(
-                f"{cam.name}: first frame. Select query points."
+                f"{cam.name}: first frame. Selecting query points with SAM."
             )
 
-            qp = self.select_query_points_manual(cropped_rgb, cam.name)
+            qp = self.select_query_points_sam(cropped_rgb, cam.name)
 
             if qp is None:
-                self.get_logger().warn(f"{cam.name}: no query points selected.")
+                self.get_logger().warn(f"{cam.name}: no SAM query points selected.")
                 return None
 
             cam.query_points_np_orig = qp
