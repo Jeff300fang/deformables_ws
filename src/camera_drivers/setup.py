@@ -30,8 +30,11 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'run_keypoint_detection = camera_drivers.run_keypoint_detection:main',
-            'fit_spline = camera_drivers.fit_spline:main'
+            'run_keypoint_detection = camera_drivers.run_keypoint_detection_sam:main',
+            'fit_spline = camera_drivers.fit_spline_v3:main',
+            'save_images = camera_drivers.save_images:main',
+            'sam = camera_drivers.sam3d:main',
+            'top = camera_drivers.top:main'
         ],
     },
 )

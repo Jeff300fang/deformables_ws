@@ -11,7 +11,7 @@ def generate_launch_description():
         Node(
             package="orbbec_camera",
             executable="orbbec_camera_node",
-            namespace="front_camera",
+            namespace="back_camera",
             name="camera",
             output="screen",
             parameters=[{
@@ -45,7 +45,7 @@ def generate_launch_description():
         Node(
             package="orbbec_camera",
             executable="orbbec_camera_node",
-            namespace="back_camera",
+            namespace="front_camera",
             name="camera",
             output="screen",
             parameters=[{

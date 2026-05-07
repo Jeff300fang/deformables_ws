@@ -121,7 +121,7 @@ class SAM31TwoCameraRopeDepthNode(Node):
 
         self.declare_parameter("calib_path", "/home/jeffreyfang/calib/dataset/calibration.json")
         self.declare_parameter("use_calibration_base", True)
-        self.declare_parameter("cam2_tx", -0.25)
+        self.declare_parameter("cam2_tx", -0.32)
         self.declare_parameter("cam2_ty", 0.1)
         self.declare_parameter("cam2_tz", 1.44)
         self.declare_parameter("cam2_roll", 3.14)
