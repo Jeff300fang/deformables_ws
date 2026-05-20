@@ -1,1 +1,5 @@
 checkpoints/
+build/
+install/
+log/
+obstacle/

@@ -1,8 +1,8 @@
 from setuptools import find_packages, setup
-from glob import glob
 import os
+from glob import glob
 
-package_name = 'camera_drivers'
+package_name = 'perception'
 
 setup(
     name=package_name,
@@ -16,10 +16,14 @@ setup(
             os.path.join("share", package_name, "launch"),
             glob("launch/*.launch.py"),
         ),
+        (
+            os.path.join("share", package_name, "checkpoints"),
+            glob("checkpoints/*"),
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='jeffreyfang',
+    maintainer='jeff',
     maintainer_email='jeff300fang@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
@@ -30,11 +34,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'run_keypoint_detection = camera_drivers.run_keypoint_detection_sam:main',
-            'fit_spline = camera_drivers.fit_spline_v3:main',
-            'save_images = camera_drivers.save_images:main',
-            'sam = camera_drivers.sam3d:main',
-            'top = camera_drivers.top:main',
+            'sam_detection_front = perception.sam_detection_front:main',
+            'sam_detection_back = perception.sam_detection_back:main',
+            'tapnn_front = perception.tap_next_next_front:main',
+            'fit_spline = perception.fit_spline:main'
         ],
     },
 )
