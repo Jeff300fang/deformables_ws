@@ -6,6 +6,7 @@ import rclpy
 
 from rclpy.node import Node
 from cv_bridge import CvBridge
+from scipy.interpolate import splprep, splev
 
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from std_msgs.msg import Float32MultiArray
@@ -27,9 +28,9 @@ class TAPNextDepthSplineNode(Node):
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 5.0)
 
-        self.declare_parameter("spline_points", 100)
+        self.declare_parameter("spline_points", 300)
         self.declare_parameter("temporal_alpha", 0.65)
-        self.declare_parameter("max_point_jump_m", 0.15)
+        self.declare_parameter("max_point_jump_m", 0.05)
 
         self.keypoints_topic = str(self.get_parameter("keypoints_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
@@ -55,6 +56,7 @@ class TAPNextDepthSplineNode(Node):
 
         self.latest_xy = None
         self.prev_points_3d = None
+        self.prev_spline_3d = None
 
         self.info_sub = self.create_subscription(
             CameraInfo,
@@ -139,6 +141,26 @@ class TAPNextDepthSplineNode(Node):
 
         return float(depth_value)
 
+    def temporal_smooth_spline(self, spline_3d, alpha=0.65):
+        spline_3d = np.asarray(spline_3d, dtype=np.float32)
+
+        if self.prev_spline_3d is None:
+            self.prev_spline_3d = spline_3d
+            return spline_3d
+
+        if self.prev_spline_3d.shape != spline_3d.shape:
+            self.prev_spline_3d = spline_3d
+            return spline_3d
+
+        smoothed = (
+            alpha * self.prev_spline_3d
+            + (1.0 - alpha) * spline_3d
+        )
+
+        self.prev_spline_3d = smoothed
+
+        return smoothed
+
     def get_valid_depth(self, depth_img, x, y, encoding):
         h, w = depth_img.shape[:2]
 
@@ -207,54 +229,92 @@ class TAPNextDepthSplineNode(Node):
 
         return smoothed
 
+    def filter_median_depth_outliers(
+        self,
+        points_3d,
+        max_depth_offset_m=0.15,
+    ):
+        points_3d = np.asarray(points_3d, dtype=np.float32)
+
+        if points_3d.shape[0] == 0:
+            return points_3d
+
+        z = points_3d[:, 2]
+
+        median_z = np.median(z)
+
+        keep = np.abs(z - median_z) <= max_depth_offset_m
+
+        filtered = points_3d[keep]
+
+        self.get_logger().info(
+            f"Median depth filter: "
+            f"median_z={median_z:.3f}m, "
+            f"kept {len(filtered)}/{len(points_3d)} points"
+        )
+
+        return filtered
+
     def fit_spline_3d(self, points_3d):
         points_3d = np.asarray(points_3d, dtype=np.float32)
 
-        if points_3d.shape[0] < 2:
+        if points_3d.shape[0] < 4:
             return points_3d
 
-        diffs = np.diff(points_3d, axis=0)
-        seg_lengths = np.linalg.norm(diffs, axis=1)
-
-        keep = np.concatenate([[True], seg_lengths > 1e-6])
+        # Remove duplicate / nearly duplicate points
+        diffs = np.linalg.norm(np.diff(points_3d, axis=0), axis=1)
+        keep = np.concatenate([[True], diffs > 1e-5])
         points_3d = points_3d[keep]
 
-        if points_3d.shape[0] < 2:
+        if points_3d.shape[0] < 4:
             return points_3d
 
-        diffs = np.diff(points_3d, axis=0)
-        seg_lengths = np.linalg.norm(diffs, axis=1)
+        k = min(3, points_3d.shape[0] - 1)
 
-        cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-        total_length = cumulative[-1]
+        try:
+            tck, _ = splprep(
+                [
+                    points_3d[:, 0],
+                    points_3d[:, 1],
+                    points_3d[:, 2],
+                ],
+                k=k,
+                s=0.1,
+            )
 
-        if total_length < 1e-6:
+            u_new = np.linspace(0.0, 1.0, self.spline_points)
+
+            x_new, y_new, z_new = splev(u_new, tck)
+
+            spline = np.stack(
+                [x_new, y_new, z_new],
+                axis=1,
+            ).astype(np.float32)
+
+            return spline
+
+        except Exception as e:
+            self.get_logger().warn(
+                f"Cubic spline fit failed, falling back to raw points: {e}"
+            )
             return points_3d
 
-        t = cumulative / total_length
-        target_t = np.linspace(0.0, 1.0, self.spline_points)
+    def optical_to_body_frame(self, points_3d):
+        points_3d = np.asarray(points_3d, dtype=np.float32)
 
-        spline = np.zeros((self.spline_points, 3), dtype=np.float32)
-        spline[:, 0] = np.interp(target_t, t, points_3d[:, 0])
-        spline[:, 1] = np.interp(target_t, t, points_3d[:, 1])
-        spline[:, 2] = np.interp(target_t, t, points_3d[:, 2])
+        if points_3d.shape[0] == 0:
+            return points_3d
 
-        if spline.shape[0] >= 5:
-            kernel = np.array([1, 2, 3, 2, 1], dtype=np.float32)
-            kernel /= np.sum(kernel)
+        x_opt = points_3d[:, 0]
+        y_opt = points_3d[:, 1]
+        z_opt = points_3d[:, 2]
 
-            padded = np.pad(spline, ((2, 2), (0, 0)), mode="edge")
+        points_body = np.zeros_like(points_3d)
+        points_body[:, 0] = z_opt
+        points_body[:, 1] = -x_opt
+        points_body[:, 2] = -y_opt
 
-            smoothed = np.zeros_like(spline)
-            for i in range(spline.shape[0]):
-                window = padded[i:i + 5]
-                smoothed[i] = np.sum(window * kernel[:, None], axis=0)
-
-            smoothed[0] = spline[0]
-            smoothed[-1] = spline[-1]
-            spline = smoothed
-
-        return spline
+        return points_body
 
     def publish_cloud(self, points, header, publisher):
         if points is None or len(points) == 0:
@@ -273,6 +333,39 @@ class TAPNextDepthSplineNode(Node):
 
         cloud_msg = pc2.create_cloud_xyz32(header, cloud_points)
         publisher.publish(cloud_msg)
+
+    def smooth_spline_points(self, spline_3d, window_size=15):
+        spline_3d = np.asarray(spline_3d, dtype=np.float32)
+
+        if spline_3d.shape[0] < window_size:
+            return spline_3d
+
+        if window_size % 2 == 0:
+            window_size += 1
+
+        kernel = np.ones(window_size, dtype=np.float32)
+        kernel /= np.sum(kernel)
+
+        pad = window_size // 2
+        padded = np.pad(
+            spline_3d,
+            ((pad, pad), (0, 0)),
+            mode="edge",
+        )
+
+        smoothed = np.zeros_like(spline_3d)
+
+        for dim in range(3):
+            smoothed[:, dim] = np.convolve(
+                padded[:, dim],
+                kernel,
+                mode="valid",
+            )
+
+        smoothed[0] = spline_3d[0]
+        smoothed[-1] = spline_3d[-1]
+
+        return smoothed
 
     def depth_callback(self, depth_msg):
         if self.fx is None:
@@ -316,16 +409,51 @@ class TAPNextDepthSplineNode(Node):
                 return
 
             points_3d = np.asarray(points_3d, dtype=np.float32)
+
+            before_filter = len(points_3d)
+
+            points_3d = self.filter_median_depth_outliers(
+                points_3d,
+                max_depth_offset_m=0.15,
+            )
+
+            after_filter = len(points_3d)
+
+            self.get_logger().info(
+                f"Consecutive-gap filter kept "
+                f"{after_filter}/{before_filter} points"
+            )
+
+            if len(points_3d) < 2:
+                self.get_logger().warn(
+                    "Not enough points after filtering"
+                )
+                return
+
             points_3d = self.filter_and_smooth_points(points_3d)
 
             spline_3d = self.fit_spline_3d(points_3d)
+
+            spline_3d = self.smooth_spline_points(
+                spline_3d,
+                window_size=15,
+            )
+
+            spline_3d = self.temporal_smooth_spline(
+                spline_3d,
+                alpha=self.temporal_alpha,
+            )
 
             self.get_logger().info(
                 f"Publishing {len(points_3d)} raw 3D points "
                 f"and {len(spline_3d)} spline points"
             )
 
+            points_3d = self.optical_to_body_frame(points_3d)
+            spline_3d = self.optical_to_body_frame(spline_3d)
+
             out_header = depth_msg.header
+            out_header.frame_id = "front_camera_body_frame"
 
             self.publish_cloud(points_3d, out_header, self.points_pub)
             self.publish_cloud(spline_3d, out_header, self.spline_pub)

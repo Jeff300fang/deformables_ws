@@ -41,7 +41,7 @@ class SingleCameraSAMRopeNode(Node):
         self.declare_parameter("run_sam_every_frame", True)
         self.declare_parameter("resize_width", 384)
 
-        self.declare_parameter("num_keypoints", 32)
+        self.declare_parameter("num_keypoints", 64)
         self.declare_parameter("min_skeleton_pixels", 20)
         self.declare_parameter("morph_kernel_size", 5)
 

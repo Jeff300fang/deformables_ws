@@ -212,59 +212,6 @@ class TAPNextFromSAMNode(Node):
 
         return cropped, resized, (startx, starty, crop_size)
 
-    def remove_far_consecutive_outliers(self, points_3d, max_gap_m=0.08):
-        points_3d = np.asarray(points_3d, dtype=np.float32)
-
-        if points_3d.shape[0] < 3:
-            return points_3d
-
-        keep = np.ones(points_3d.shape[0], dtype=bool)
-
-        changed = True
-        while changed:
-            changed = False
-            active_idx = np.where(keep)[0]
-
-            if len(active_idx) < 3:
-                break
-
-            active_points = points_3d[active_idx]
-            gaps = np.linalg.norm(np.diff(active_points, axis=0), axis=1)
-
-            bad = np.where(gaps > max_gap_m)[0]
-
-            if len(bad) == 0:
-                break
-
-            j = int(bad[0])
-
-            left_i = active_idx[j]
-            right_i = active_idx[j + 1]
-
-            # Decide which of the two points is more likely the outlier.
-            # Compare each point to its outer neighbor when available.
-            left_score = 0.0
-            right_score = 0.0
-
-            if j - 1 >= 0:
-                prev_p = active_points[j - 1]
-                left_score += np.linalg.norm(points_3d[left_i] - prev_p)
-
-            if j + 2 < len(active_points):
-                next_p = active_points[j + 2]
-                right_score += np.linalg.norm(points_3d[right_i] - next_p)
-
-            # If left point is farther from its previous neighbor, remove left.
-            # If right point is farther from its next neighbor, remove right.
-            if left_score > right_score:
-                keep[left_i] = False
-            else:
-                keep[right_i] = False
-
-            changed = True
-
-        return points_3d[keep]
-
     def preprocess_frame(self, frame_rgb):
         cropped_rgb, resized_rgb, crop_info = self.crop_and_downscale(frame_rgb)
 
