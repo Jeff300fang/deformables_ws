@@ -11,7 +11,7 @@ from scipy.interpolate import splprep, splev
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from std_msgs.msg import Float32MultiArray
 import sensor_msgs_py.point_cloud2 as pc2
-
+from geometry_msgs.msg import PoseArray, Pose
 
 class TAPNextDepthSplineNode(Node):
     def __init__(self):
@@ -88,6 +88,12 @@ class TAPNextDepthSplineNode(Node):
         self.spline_pub = self.create_publisher(
             PointCloud2,
             self.spline_3d_topic,
+            10,
+        )
+
+        self.rope_pose_pub = self.create_publisher(
+            PoseArray,
+            "rope_poses",
             10,
         )
 
@@ -254,6 +260,65 @@ class TAPNextDepthSplineNode(Node):
         )
 
         return filtered
+
+    def sample_spline_by_distance(
+        self,
+        spline_3d,
+        spacing_m=0.15,
+    ):
+        spline_3d = np.asarray(spline_3d, dtype=np.float32)
+
+        if spline_3d.shape[0] < 2:
+            return spline_3d
+
+        diffs = np.diff(spline_3d, axis=0)
+        seg_lengths = np.linalg.norm(diffs, axis=1)
+
+        cumulative = np.concatenate(
+            [[0.0], np.cumsum(seg_lengths)]
+        )
+
+        total_length = cumulative[-1]
+
+        if total_length < 1e-6:
+            return spline_3d[:1]
+
+        target_distances = np.arange(
+            0.0,
+            total_length + spacing_m,
+            spacing_m,
+        )
+
+        sampled = []
+
+        for d in target_distances:
+            idx = np.searchsorted(cumulative, d)
+
+            if idx == 0:
+                sampled.append(spline_3d[0])
+                continue
+
+            if idx >= len(spline_3d):
+                sampled.append(spline_3d[-1])
+                continue
+
+            d0 = cumulative[idx - 1]
+            d1 = cumulative[idx]
+
+            if abs(d1 - d0) < 1e-6:
+                sampled.append(spline_3d[idx])
+                continue
+
+            t = (d - d0) / (d1 - d0)
+
+            p = (
+                (1.0 - t) * spline_3d[idx - 1]
+                + t * spline_3d[idx]
+            )
+
+            sampled.append(p)
+
+        return np.asarray(sampled, dtype=np.float32)
 
     def fit_spline_3d(self, points_3d):
         points_3d = np.asarray(points_3d, dtype=np.float32)
@@ -452,15 +517,43 @@ class TAPNextDepthSplineNode(Node):
             points_3d = self.optical_to_body_frame(points_3d)
             spline_3d = self.optical_to_body_frame(spline_3d)
 
+
+            rope_pose_points = self.sample_spline_by_distance(
+                spline_3d,
+                spacing_m=0.15,
+            )
+
             out_header = depth_msg.header
             out_header.frame_id = "front_camera_body_frame"
 
             self.publish_cloud(points_3d, out_header, self.points_pub)
             self.publish_cloud(spline_3d, out_header, self.spline_pub)
+            self.publish_rope_poses(
+                rope_pose_points,
+                out_header,
+            )
 
         except Exception as e:
             self.get_logger().error(f"Depth spline callback failed: {e}")
 
+    def publish_rope_poses(self, points, header):
+        msg = PoseArray()
+        msg.header = header
+
+        points = np.asarray(points, dtype=np.float32)
+
+        for p in points:
+            pose = Pose()
+
+            pose.position.x = float(p[0])
+            pose.position.y = float(p[1])
+            pose.position.z = float(p[2])
+
+            pose.orientation.w = 1.0
+
+            msg.poses.append(pose)
+
+        self.rope_pose_pub.publish(msg)
 
 def main(args=None):
     rclpy.init(args=args)

@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            "render_rope = planner.render_rope:main"
         ],
     },
 )
