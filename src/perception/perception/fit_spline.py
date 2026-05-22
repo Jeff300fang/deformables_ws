@@ -11,6 +11,7 @@ from scipy.interpolate import splprep, splev
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from std_msgs.msg import Float32MultiArray
 import sensor_msgs_py.point_cloud2 as pc2
+from rcl_interfaces.msg import SetParametersResult
 
 
 class TAPNextDepthSplineNode(Node):
@@ -47,6 +48,7 @@ class TAPNextDepthSplineNode(Node):
         self.body_translation_z = float(
             self.get_parameter("body_translation_z").value
         )
+        self.add_on_set_parameters_callback(self.parameter_callback)
 
         self.keypoints_topic = str(self.get_parameter("keypoints_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
@@ -112,6 +114,41 @@ class TAPNextDepthSplineNode(Node):
         self.get_logger().info(f"Subscribed camera info: {self.camera_info_topic}")
         self.get_logger().info(f"Publishing raw 3D points: {self.points_3d_topic}")
         self.get_logger().info(f"Publishing spline 3D points: {self.spline_3d_topic}")
+
+    def parameter_callback(self, params):
+        try:
+            for param in params:
+                if param.name == "depth_search_radius":
+                    self.depth_search_radius = int(param.value)
+
+                elif param.name == "min_depth_m":
+                    self.min_depth_m = float(param.value)
+
+                elif param.name == "max_depth_m":
+                    self.max_depth_m = float(param.value)
+
+                elif param.name == "spline_points":
+                    self.spline_points = int(param.value)
+
+                elif param.name == "temporal_alpha":
+                    self.temporal_alpha = float(param.value)
+
+                elif param.name == "max_point_jump_m":
+                    self.max_point_jump_m = float(param.value)
+
+                elif param.name == "body_translation_x":
+                    self.body_translation_x = float(param.value)
+
+                elif param.name == "body_translation_y":
+                    self.body_translation_y = float(param.value)
+
+                elif param.name == "body_translation_z":
+                    self.body_translation_z = float(param.value)
+
+            return SetParametersResult(successful=True)
+
+        except Exception as e:
+            return SetParametersResult(successful=False, reason=str(e))
 
     def camera_info_callback(self, msg):
         self.fx = float(msg.k[0])
