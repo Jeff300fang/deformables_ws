@@ -8,6 +8,7 @@ from pydrake.all import (
     Parser,
     RigidTransform,
     Solve,
+    RotationMatrix
 )
 
 
@@ -119,6 +120,16 @@ class SingleIiwaPositionIK:
             p_AQ_lower=p_WQ - position_tol,
             p_AQ_upper=p_WQ + position_tol,
         )
+
+        # R_W7_desired = RotationMatrix.MakeXRotation(np.pi)
+
+        # ik.AddOrientationConstraint(
+        #     frameAbar=self.plant.world_frame(),
+        #     R_AbarA=R_W7_desired,
+        #     frameBbar=self.link7_frame,
+        #     R_BbarB=RotationMatrix(),
+        #     theta_bound=0.15,
+        # )
 
         # Prefer solutions close to the previous waypoint.
         Q = np.eye(7)
