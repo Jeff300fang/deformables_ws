@@ -16,6 +16,12 @@ def generate_launch_description():
         "sam3.pt",
     )
 
+    tapnn_checkpoint = os.path.join(
+        perception_share,
+        "checkpoints",
+        "tapnextpp_ckpt.pt",
+    )
+
     front_node = Node(
         package="perception",
         executable="sam_detection_front",
@@ -44,10 +50,22 @@ def generate_launch_description():
         package="perception",
         executable="tapnn_front",
         output="screen",
+        parameters=[
+            {
+                "tapnn_checkpoint_path": tapnn_checkpoint
+            }
+        ]
+    )
+
+    fit_spline = Node(
+        package="perception",
+        executable="fit_spline",
+        output="screen",
     )
 
     return LaunchDescription([
         front_node,
         back_node,
         tapnn_front,
+        fit_spline
     ])

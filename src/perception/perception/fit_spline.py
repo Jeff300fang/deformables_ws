@@ -32,6 +32,22 @@ class TAPNextDepthSplineNode(Node):
         self.declare_parameter("temporal_alpha", 0.65)
         self.declare_parameter("max_point_jump_m", 0.05)
 
+        self.declare_parameter("body_translation_x", 0.0)
+        self.declare_parameter("body_translation_y", 0.0)
+        self.declare_parameter("body_translation_z", 0.0)
+
+        self.body_translation_x = float(
+            self.get_parameter("body_translation_x").value
+        )
+
+        self.body_translation_y = float(
+            self.get_parameter("body_translation_y").value
+        )
+
+        self.body_translation_z = float(
+            self.get_parameter("body_translation_z").value
+        )
+
         self.keypoints_topic = str(self.get_parameter("keypoints_topic").value)
         self.depth_topic = str(self.get_parameter("depth_topic").value)
         self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
@@ -375,9 +391,20 @@ class TAPNextDepthSplineNode(Node):
         z_opt = points_3d[:, 2]
 
         points_body = np.zeros_like(points_3d)
+
+        # optical -> body
         points_body[:, 0] = z_opt
         points_body[:, 1] = -x_opt
         points_body[:, 2] = -y_opt
+
+        # additional 180 deg rotation about z-axis
+        points_body[:, 0] *= -1
+        points_body[:, 1] *= -1
+
+        # translation
+        points_body[:, 0] += self.body_translation_x
+        points_body[:, 1] += self.body_translation_y
+        points_body[:, 2] += self.body_translation_z
 
         return points_body
 

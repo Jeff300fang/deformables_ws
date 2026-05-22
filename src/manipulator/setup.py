@@ -1,6 +1,9 @@
 from setuptools import find_packages, setup
 
-package_name = 'planner'
+from glob import glob
+import os
+
+package_name = 'manipulator'
 
 setup(
     name=package_name,
@@ -10,10 +13,14 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (
+            os.path.join('share', package_name, 'launch'),
+            glob('launch/*.launch.py'),
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='jeff',
+    maintainer='jeffreyfang',
     maintainer_email='jeff300fang@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
@@ -24,9 +31,11 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "render_rope = planner.render_rope:main"
-            'test_velocity = planner.test_velocity_control_once:main',
-            'teleop = planner.teleop:main',
+            "get_end_effector_pose = manipulator.get_end_effector_pose:main",
+            "move_to_pose = manipulator.move_to_pose:main",
+            "arm_driver = manipulator.arm_driver:main",
+            "left_grip = manipulator.left_grip:main",
+            "right_grip = manipulator.right_grip:main",
         ],
     },
 )
