@@ -40,7 +40,7 @@ class TAPNextFromSAMNode(Node):
             "/front_camera/tapnext/annotated_image/compressed",
         )
         self.declare_parameter(
-            "ckpt_path",
+            "tapnn_checkpoint_path",
             "/home/jeff/trustworthroboticsgroup/CoRL2026/deformables_ws/src/tapnet/checkpoints/tapnextpp_ckpt.pt",
         )
 
@@ -54,7 +54,7 @@ class TAPNextFromSAMNode(Node):
             self.get_parameter("tracked_keypoints_topic").value
         )
         self.annotated_topic = str(self.get_parameter("annotated_topic").value)
-        self.ckpt_path = str(self.get_parameter("ckpt_path").value)
+        self.ckpt_path = str(self.get_parameter("tapnn_checkpoint_path").value)
 
         self.max_sam_reinit_rate_hz = float(
             self.get_parameter("max_sam_reinit_rate_hz").value

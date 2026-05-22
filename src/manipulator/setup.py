@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'planner'
+package_name = 'manipulator'
 
 setup(
     name=package_name,
@@ -13,7 +13,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='jeff',
+    maintainer='jeffreyfang',
     maintainer_email='jeff300fang@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
@@ -24,8 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'test_velocity = planner.test_velocity_control_once:main',
-            'teleop = planner.teleop:main',
+            "get_end_effector_pose = manipulator.get_end_effector_pose:main",
+            "move_to_pose = manipulator.move_to_pose:main",
+            "arm_driver = manipulator.arm_driver:main",
         ],
     },
 )

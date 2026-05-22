@@ -3,3 +3,5 @@ build/
 install/
 log/
 obstacle/
+.vscode
+__pycache__/

@@ -74,29 +74,29 @@ def generate_launch_description():
         # =========================
         # Intel RealSense
         # =========================
-        Node(
-            package="realsense2_camera",
-            executable="realsense2_camera_node",
-            namespace="realsense",
-            name="camera",
-            output="screen",
-            parameters=[{
-                "enable_color": True,
-                "enable_depth": True,
-                "enable_infra1": False,
-                "enable_infra2": False,
+        # Node(
+        #     package="realsense2_camera",
+        #     executable="realsense2_camera_node",
+        #     namespace="realsense",
+        #     name="camera",
+        #     output="screen",
+        #     parameters=[{
+        #         "enable_color": True,
+        #         "enable_depth": True,
+        #         "enable_infra1": False,
+        #         "enable_infra2": False,
 
-                # Depth-to-color alignment
-                "align_depth.enable": True,
+        #         # Depth-to-color alignment
+        #         "align_depth.enable": True,
 
-                # 🔧 ALSO constrain profiles (prevents USB overload)
-                "rgb_camera.width": 640,
-                "rgb_camera.height": 480,
-                "rgb_camera.fps": 30,
+        #         # 🔧 ALSO constrain profiles (prevents USB overload)
+        #         "rgb_camera.width": 640,
+        #         "rgb_camera.height": 480,
+        #         "rgb_camera.fps": 30,
 
-                "depth_module.width": 640,
-                "depth_module.height": 480,
-                "depth_module.fps": 30,
-            }],
-        ),
+        #         "depth_module.width": 640,
+        #         "depth_module.height": 480,
+        #         "depth_module.fps": 30,
+        #     }],
+        # ),
     ])
