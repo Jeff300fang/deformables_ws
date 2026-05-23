@@ -13,25 +13,25 @@ from geometry_msgs.msg import PoseStamped
 
 class IiwaPoseTeleopNode(Node):
     def __init__(self):
-        super().__init__("iiwa_pose_teleop_node")
+        super().__init__("right_iiwa_pose_teleop_node")
 
         self.sub = self.create_subscription(
             PoseStamped,
-            "/left/end_effector_pose",
+            "/right/end_effector_pose",
             self.pose_callback,
             10,
         )
 
         self.pub = self.create_publisher(
             PoseStamped,
-            "/left/iiwa/goal_pose",
+            "/right/iiwa/goal_pose",
             10,
         )
 
         self.current_pose = None
         self.goal_pose = None
 
-        self.step = 0.001  # 2 mm
+        self.step = 0.005  # 2 mm
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
