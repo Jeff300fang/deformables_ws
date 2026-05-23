@@ -24,10 +24,11 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "render_rope = planner.render_rope:main",
+            'render_rope = planner.render_rope:main',
             'test_velocity = planner.test_velocity_control_once:main',
             'left_teleop = planner.left_teleop:main',
             'right_teleop = planner.right_teleop:main',
+            'run_planner = planner.run_planner:main',
         ],
     },
 )
