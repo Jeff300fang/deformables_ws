@@ -31,9 +31,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "get_end_effector_pose = manipulator.get_end_effector_pose:main",
-            "move_to_pose = manipulator.move_to_pose:main",
-            "arm_driver = manipulator.arm_driver:main",
+            "left_get_end_effector_pose = manipulator.left_get_end_effector_pose:main",
+            "left_move_to_pose = manipulator.left_move_to_pose:main",
+            "left_arm_driver = manipulator.left_arm_driver:main",
             "left_grip = manipulator.left_grip:main",
             "right_grip = manipulator.right_grip:main",
         ],

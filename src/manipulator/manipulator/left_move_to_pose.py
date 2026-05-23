@@ -17,18 +17,16 @@ from manipulator.iiwa_cartesian_ik import SingleIiwaPositionIK
 
 class IiwaMpcGoalPoseNode(Node):
     def __init__(self):
-        super().__init__("iiwa_mpc_goal_pose_node")
+        super().__init__("left_iiwa_mpc_goal_pose_node")
 
-        self.declare_parameter("goal_topic", "/iiwa/goal_pose")
-        self.declare_parameter("command_topic", "/iiwa/joint_position_command")
         self.declare_parameter("lcm_status_channel", "IIWA_STATUS")
 
         self.declare_parameter("position_tol", 0.001)
-        self.declare_parameter("max_joint_step_deg", 12.0)
+        self.declare_parameter("max_joint_step_deg", 20.0)
         self.declare_parameter("max_cartesian_step_m", 0.1)
 
-        self.goal_topic = self.get_parameter("goal_topic").value
-        self.command_topic = self.get_parameter("command_topic").value
+        self.goal_topic = "/left/iiwa/goal_pose"
+        self.command_topic = "/left/iiwa/joint_position_command"
         self.lcm_status_channel = self.get_parameter("lcm_status_channel").value
 
         self.position_tol = float(self.get_parameter("position_tol").value)
@@ -108,7 +106,11 @@ class IiwaMpcGoalPoseNode(Node):
             return
         p_now = self.ik.fk_position(q_now)
         cartesian_step = float(np.linalg.norm(p_goal - p_now))
-
+        if p_goal[2] < 0.2:
+            self.get_logger().warn(
+                f"Rejected goal pose: z={p_goal[2]:.3f} m is below limit 0.200 m"
+            )
+            return
         if cartesian_step > self.max_cartesian_step_m + 0.001:
             self.get_logger().warn(
                 f"Rejected goal pose: step is {cartesian_step * 1000.0:.2f} mm, "

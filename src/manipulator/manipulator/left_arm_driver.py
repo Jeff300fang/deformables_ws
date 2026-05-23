@@ -14,15 +14,14 @@ from pydrake.all import DrakeLcm
 
 class SafeIiwaJointExecutor(Node):
     def __init__(self):
-        super().__init__("safe_iiwa_joint_executor")
+        super().__init__("left_safe_iiwa_joint_executor")
 
-        self.declare_parameter("input_topic", "/iiwa/joint_position_command")
         self.declare_parameter("lcm_status_channel", "IIWA_STATUS")
         self.declare_parameter("lcm_command_channel", "IIWA_COMMAND")
         self.declare_parameter("max_joint_delta_deg", 3.0)
         self.declare_parameter("status_timeout_sec", 0.2)
 
-        self.input_topic = self.get_parameter("input_topic").value
+        self.input_topic = "/left/iiwa/joint_position_command"
         self.lcm_status_channel = self.get_parameter("lcm_status_channel").value
         self.lcm_command_channel = self.get_parameter("lcm_command_channel").value
         self.max_joint_delta_deg = float(

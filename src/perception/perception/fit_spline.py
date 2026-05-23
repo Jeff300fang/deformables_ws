@@ -315,62 +315,35 @@ class TAPNextDepthSplineNode(Node):
 
         return filtered
 
-    def sample_spline_by_distance(
-        self,
-        spline_3d,
-        spacing_m=0.15,
-    ):
-        spline_3d = np.asarray(spline_3d, dtype=np.float32)
+    def sample_by_exact_euclidean_distance(self, points, spacing_m=0.1, num_segments=15):
+        points = np.asarray(points, dtype=np.float32)
 
-        if spline_3d.shape[0] < 2:
-            return spline_3d
+        if points.shape[0] == 0:
+            return points
 
-        diffs = np.diff(spline_3d, axis=0)
-        seg_lengths = np.linalg.norm(diffs, axis=1)
+        sampled = [points[0].copy()]
+        last = points[0].astype(np.float32)
 
-        cumulative = np.concatenate(
-            [[0.0], np.cumsum(seg_lengths)]
-        )
+        i = 1
+        while i < len(points) and len(sampled) < num_segments + 1:
+            p = points[i].astype(np.float32)
 
-        total_length = cumulative[-1]
+            v = p - last
+            dist = np.linalg.norm(v)
 
-        if total_length < 1e-6:
-            return spline_3d[:1]
-
-        target_distances = np.arange(
-            0.0,
-            total_length + spacing_m,
-            spacing_m,
-        )
-
-        sampled = []
-
-        for d in target_distances:
-            idx = np.searchsorted(cumulative, d)
-
-            if idx == 0:
-                sampled.append(spline_3d[0])
+            if dist < 1e-8:
+                i += 1
                 continue
 
-            if idx >= len(spline_3d):
-                sampled.append(spline_3d[-1])
-                continue
+            if dist >= spacing_m:
+                new_p = last + (spacing_m / dist) * v
+                sampled.append(new_p.astype(np.float32))
+                last = new_p.astype(np.float32)
 
-            d0 = cumulative[idx - 1]
-            d1 = cumulative[idx]
-
-            if abs(d1 - d0) < 1e-6:
-                sampled.append(spline_3d[idx])
-                continue
-
-            t = (d - d0) / (d1 - d0)
-
-            p = (
-                (1.0 - t) * spline_3d[idx - 1]
-                + t * spline_3d[idx]
-            )
-
-            sampled.append(p)
+                # Do not increment i.
+                # There may still be room before points[i].
+            else:
+                i += 1
 
         return np.asarray(sampled, dtype=np.float32)
 
@@ -583,9 +556,10 @@ class TAPNextDepthSplineNode(Node):
             spline_3d = self.optical_to_body_frame(spline_3d)
 
 
-            rope_pose_points = self.sample_spline_by_distance(
+            rope_pose_points = self.sample_by_exact_euclidean_distance(
                 spline_3d,
-                spacing_m=0.15,
+                spacing_m=0.1,
+                num_segments=9,
             )
 
             out_header = depth_msg.header

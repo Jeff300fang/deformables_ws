@@ -75,10 +75,10 @@ class IiwaFK:
 class EndEffectorPosePublisher(Node):
 
     def __init__(self):
-        super().__init__("iiwa_end_effector_pose_publisher")
+        super().__init__("left_iiwa_end_effector_pose_publisher")
 
         self.declare_parameter("arm", 0)
-        self.declare_parameter("publish_rate", 50.0)
+        self.declare_parameter("publish_rate", 100.0)
 
         self.arm = int(
             self.get_parameter("arm").value
@@ -98,7 +98,14 @@ class EndEffectorPosePublisher(Node):
 
         self.pose_pub = self.create_publisher(
             PoseStamped,
-            "end_effector_pose",
+            "/left/end_effector_pose",
+            10,
+        )
+
+
+        self.work_station_pose_pub = self.create_publisher(
+            PoseStamped,
+            "/left/workstation/end_effector_pose",
             10,
         )
 
@@ -134,7 +141,7 @@ class EndEffectorPosePublisher(Node):
         # Process pending LCM messages
         #
         self.lcm.HandleSubscriptions(1)
-        self.get_logger().info(f"{self.latest_q}")
+        # self.get_logger().info(f"{self.latest_q}")
         if self.latest_q is None:
             return
 
@@ -159,9 +166,22 @@ class EndEffectorPosePublisher(Node):
 
         self.pose_pub.publish(pose_msg)
 
-        rpy_deg = np.rad2deg(
-            RollPitchYaw(X_W_EE.rotation()).vector()
-        )
+        # rpy_deg = np.rad2deg(
+        #     RollPitchYaw(X_W_EE.rotation()).vector()
+        # )
+
+        workstation_pose_msg = PoseStamped()
+        workstation_pose_msg.header.stamp = self.get_clock().now().to_msg()
+        workstation_pose_msg.header.frame_id = "workstation"
+        workstation_pose_msg.pose.position.x = float(p[0]) - 0.4
+        workstation_pose_msg.pose.position.y = float(p[1]) + 0.15 + 0.5
+        workstation_pose_msg.pose.position.z = float(p[2]) - 0.2
+        workstation_pose_msg.pose.orientation.w = float(quat.w())
+        workstation_pose_msg.pose.orientation.x = float(quat.x())
+        workstation_pose_msg.pose.orientation.y = float(quat.y())
+        workstation_pose_msg.pose.orientation.z = float(quat.z())
+        self.work_station_pose_pub.publish(workstation_pose_msg)
+        
 
         # self.get_logger().info(
         #     f"p = {np.round(p, 4)} | "

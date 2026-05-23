@@ -121,15 +121,15 @@ class SingleIiwaPositionIK:
             p_AQ_upper=p_WQ + position_tol,
         )
 
-        # R_W7_desired = RotationMatrix.MakeXRotation(np.pi)
+        R_W7_desired = RotationMatrix.MakeZRotation(np.pi/2) @ RotationMatrix.MakeXRotation(np.pi)
 
-        # ik.AddOrientationConstraint(
-        #     frameAbar=self.plant.world_frame(),
-        #     R_AbarA=R_W7_desired,
-        #     frameBbar=self.link7_frame,
-        #     R_BbarB=RotationMatrix(),
-        #     theta_bound=0.15,
-        # )
+        ik.AddOrientationConstraint(
+            frameAbar=frame_W,
+            R_AbarA=R_W7_desired,
+            frameBbar=self.link7_frame,
+            R_BbarB=RotationMatrix(),
+            theta_bound=np.deg2rad(3.0),
+        )
 
         # Prefer solutions close to the previous waypoint.
         Q = np.eye(7)

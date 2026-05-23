@@ -17,21 +17,21 @@ class IiwaPoseTeleopNode(Node):
 
         self.sub = self.create_subscription(
             PoseStamped,
-            "/end_effector_pose",
+            "/left/end_effector_pose",
             self.pose_callback,
             10,
         )
 
         self.pub = self.create_publisher(
             PoseStamped,
-            "/iiwa/goal_pose",
+            "/left/iiwa/goal_pose",
             10,
         )
 
         self.current_pose = None
         self.goal_pose = None
 
-        self.step = 0.003  # 2 mm
+        self.step = 0.001  # 2 mm
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
