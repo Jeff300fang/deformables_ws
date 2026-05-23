@@ -63,9 +63,9 @@ def generate_launch_description():
         output="screen",
         parameters=[
             {
-                "body_translation_x": 0.85,
+                "body_translation_x": 0.88,
                 "body_translation_y": 0.0,
-                "body_translation_z": 0.3,
+                "body_translation_z": 0.29,
             }
         ],
     )
