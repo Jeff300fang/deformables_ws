@@ -13,13 +13,6 @@ def generate_launch_description():
         output="screen",
     )
 
-    right_grip_node = Node(
-        package="manipulator",
-        executable="right_grip",
-        name="right_grip_node",
-        output="screen",
-    )
-
     left_get_end_effector_pose = Node(
         package="manipulator",
         executable="left_get_end_effector_pose",
@@ -44,7 +37,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         left_grip_node,
-        right_grip_node,
         left_get_end_effector_pose,
         left_move_to_pose,
         left_arm_driver,

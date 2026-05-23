@@ -17,14 +17,6 @@ from pydrake.all import (
 )
 
 
-def get_channel_suffix(arm: int) -> str:
-    if arm == 0:
-        return ""
-    if arm == 1:
-        return "_2"
-    raise ValueError("arm must be 0 or 1")
-
-
 class IiwaFK:
     def __init__(
         self,
@@ -75,22 +67,15 @@ class IiwaFK:
 class EndEffectorPosePublisher(Node):
 
     def __init__(self):
-        super().__init__("left_iiwa_end_effector_pose_publisher")
+        super().__init__("right_iiwa_end_effector_pose_publisher")
 
-        self.declare_parameter("arm", 0)
         self.declare_parameter("publish_rate", 500.0)
-
-        self.arm = int(
-            self.get_parameter("arm").value
-        )
 
         publish_rate = float(
             self.get_parameter("publish_rate").value
         )
 
-        suffix = get_channel_suffix(self.arm)
-
-        self.status_channel = "IIWA_STATUS" + suffix
+        self.status_channel = "IIWA_STATUS_2"
 
         self.get_logger().info(
             f"Listening to LCM channel: {self.status_channel}"
@@ -98,14 +83,14 @@ class EndEffectorPosePublisher(Node):
 
         self.pose_pub = self.create_publisher(
             PoseStamped,
-            "/left/end_effector_pose",
+            "/right/end_effector_pose",
             1,
         )
 
 
         self.work_station_pose_pub = self.create_publisher(
             PoseStamped,
-            "/left/workstation/end_effector_pose",
+            "/right/workstation/end_effector_pose",
             1,
         )
 
@@ -170,12 +155,14 @@ class EndEffectorPosePublisher(Node):
         #     RollPitchYaw(X_W_EE.rotation()).vector()
         # )
 
+
+        # TODO: Fix these
         workstation_pose_msg = PoseStamped()
         workstation_pose_msg.header.stamp = self.get_clock().now().to_msg()
         workstation_pose_msg.header.frame_id = "workstation"
-        workstation_pose_msg.pose.position.x = float(p[0]) - 0.4
-        workstation_pose_msg.pose.position.y = float(p[1]) + 0.15 + 0.5
-        workstation_pose_msg.pose.position.z = float(p[2]) - 0.2
+        workstation_pose_msg.pose.position.x = float(p[0]) - 0.405
+        workstation_pose_msg.pose.position.y = float(p[1]) - 0.15 - 0.5
+        workstation_pose_msg.pose.position.z = float(p[2]) - 0.22
         workstation_pose_msg.pose.orientation.w = float(quat.w())
         workstation_pose_msg.pose.orientation.x = float(quat.x())
         workstation_pose_msg.pose.orientation.y = float(quat.y())

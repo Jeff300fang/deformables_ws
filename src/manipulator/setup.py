@@ -36,6 +36,9 @@ setup(
             "left_arm_driver = manipulator.left_arm_driver:main",
             "left_grip = manipulator.left_grip:main",
             "right_grip = manipulator.right_grip:main",
+            "right_get_end_effector_pose = manipulator.right_get_end_effector_pose:main",
+            "right_move_to_pose = manipulator.right_move_to_pose:main",
+            "right_arm_driver = manipulator.right_arm_driver:main",
         ],
     },
 )
