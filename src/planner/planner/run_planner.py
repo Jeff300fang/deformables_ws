@@ -138,24 +138,22 @@ class RopeStateSolverNode(Node):
         super().__init__("rope_state_solver_node")
 
         self.declare_parameter("rope_state_topic", "/rope_poses")
-        self.declare_parameter(
-            "end_effector_pose_topic",
-            "/right/workstation/end_effector_pose",
-        )
-
         self.rope_state_topic = str(self.get_parameter("rope_state_topic").value)
-        self.end_effector_pose_topic = str(
-            self.get_parameter("end_effector_pose_topic").value
-        )
 
         self.latest_ee_pos_left = None
         self.latest_ee_pos_right = None
 
-        self.latest_ee_pos_seq = 0
-        self.ee_base_frame_seq = 0
+        self.latest_ee_pos_seq_left = 0
+        self.latest_ee_pos_seq_right = 0
 
-        self.last_solve_latest_ee_pos_seq = -1
-        self.last_solve_ee_base_frame_seq = -1
+        self.ee_base_frame_seq_left = 0
+        self.ee_base_frame_seq_right = 0
+
+        self.last_solve_latest_ee_pos_seq_left = -1
+        self.last_solve_latest_ee_pos_seq_right = -1
+
+        self.last_solve_ee_base_frame_seq_left = -1
+        self.last_solve_ee_base_frame_seq_right = -1
 
         self.server = viser.ViserServer()
         _ = self.server.scene.add_grid(name="ground")
@@ -168,9 +166,9 @@ class RopeStateSolverNode(Node):
             youngs_modulus=1e5,
             mass_density=300,
             num_floating_grippers=2,
-            grip_stiffness=100,
+            grip_stiffness=2000,
             gripper_radius=0.02,
-            contact_smoothing=1e-3,
+            contact_smoothing=3e-3,
         )
 
         self.N = 50
@@ -185,31 +183,12 @@ class RopeStateSolverNode(Node):
             c_grip=jnp.array([1.0, 1.0]),
         )
 
-        # x_coords = (
-        #     jnp.arange(self.env.params.num_nodes)
-        #     * self.env.params.segment_length
-        #     - 0.2
-        # )
-
-        # goal_nodes = jnp.stack(
-        #     (
-        #         x_coords,
-        #         jnp.zeros_like(x_coords),
-        #         jnp.zeros_like(x_coords),
-        #     ),
-        #     axis=1,
-        # )
         y_coords = (
             jnp.arange(self.env.params.num_nodes) * self.env.params.segment_length
             - 0.5
         )
 
-        # Make the right side higher and gradually slope downward
-        z_coords = jnp.linspace(
-            0.0,   # left end height
-            0.3,   # right end height
-            self.env.params.num_nodes,
-        )
+        z_coords = jnp.ones(self.env.params.num_nodes) * 0.05
 
         nodes = jnp.stack(
             (
@@ -225,10 +204,8 @@ class RopeStateSolverNode(Node):
         )
 
         vmax = 0.2
-        self.u_max = jnp.array([
-            vmax, vmax, vmax, 10.0,
-            vmax, vmax, vmax, 10.0,
-        ])
+        u_max = jnp.array([vmax, vmax, vmax, 10.0])
+        self.u_max = jnp.repeat(u_max, 2)
 
         self.constraints = make_control_constraints(
             u_min=-self.u_max,
@@ -254,13 +231,6 @@ class RopeStateSolverNode(Node):
             1,
         )
 
-        self.ee_sub_right = self.create_subscription(
-            PoseStamped,
-            "/right/workstation/end_effector_pose",
-            self.end_effector_right_pose_callback,
-            1,
-        )
-
         self.ee_sub_left = self.create_subscription(
             PoseStamped,
             "/left/workstation/end_effector_pose",
@@ -268,10 +238,10 @@ class RopeStateSolverNode(Node):
             1,
         )
 
-        self.ee_base_frame_sub_right = self.create_subscription(
+        self.ee_sub_right = self.create_subscription(
             PoseStamped,
-            "/right/end_effector_pose",
-            self.ee_base_frame_right_callback,
+            "/right/workstation/end_effector_pose",
+            self.end_effector_right_pose_callback,
             1,
         )
 
@@ -279,6 +249,13 @@ class RopeStateSolverNode(Node):
             PoseStamped,
             "/left/end_effector_pose",
             self.ee_base_frame_left_callback,
+            1,
+        )
+
+        self.ee_base_frame_sub_right = self.create_subscription(
+            PoseStamped,
+            "/right/end_effector_pose",
+            self.ee_base_frame_right_callback,
             1,
         )
 
@@ -295,7 +272,6 @@ class RopeStateSolverNode(Node):
         )
 
         self.get_logger().info(f"Subscribed to {self.rope_state_topic}")
-        self.get_logger().info(f"Subscribed to {self.end_effector_pose_topic}")
         self.get_logger().info("Waiting for first real gripper pose before initializing state.")
 
         self.num_iterations = 0
@@ -307,28 +283,29 @@ class RopeStateSolverNode(Node):
 
     def ee_base_frame_left_callback(self, msg):
         self.ee_base_frame_left = msg
-        self.ee_base_frame_seq += 1
+        self.ee_base_frame_seq_left += 1
 
     def ee_base_frame_right_callback(self, msg):
         self.ee_base_frame_right = msg
-        self.ee_base_frame_seq += 1
+        self.ee_base_frame_seq_right += 1
 
     def end_effector_left_pose_callback(self, msg):
         p = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
         )
-        self.latest_ee_pos_left = p
-        self.latest_ee_pos_seq += 1
 
+        self.latest_ee_pos_left = p
+        self.latest_ee_pos_seq_left += 1
 
     def end_effector_right_pose_callback(self, msg):
         p = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
         )
+
         self.latest_ee_pos_right = p
-        self.latest_ee_pos_seq += 1
+        self.latest_ee_pos_seq_right += 1
 
     def get_latest_grip_positions(self):
         if self.latest_ee_pos_left is None or self.latest_ee_pos_right is None:
@@ -349,8 +326,7 @@ class RopeStateSolverNode(Node):
 
             return (
                 1.0 * jnp.sum(state_err[:-6] ** 2)
-                + 0.1 * jnp.sum(control_err[0:3] ** 2)
-                + 0.1 * jnp.sum(control_err[4:7] ** 2)
+                + 0.1 * jnp.sum(control_err[:-2] ** 2)
             )
 
         def dynamics(x, u, t, parameter):
@@ -550,20 +526,22 @@ class RopeStateSolverNode(Node):
             link_length=self.env.params.segment_length,
         )
 
-        closest_dist, closest_seg_idx, closest_t, closest_point = (
+        closest_dist_left, closest_seg_idx, closest_t, closest_point = (
             self.closest_point_on_rope_segments(sampled, grip_positions[0])
         )
 
-        self.get_logger().info(
-            f"Closest rope point to gripper: "
-            f"dist={closest_dist:.4f} m, "
-            f"segment={closest_seg_idx}->{closest_seg_idx + 1}, "
-            f"t={closest_t:.3f}, "
-            f"point={closest_point}, "
-            f"grip={grip_positions[0]}"
+        closest_dist_right, closest_seg_idx, closest_t, closest_point = (
+            self.closest_point_on_rope_segments(sampled, grip_positions[1])
         )
 
-        if closest_dist <= 0.031:
+        self.get_logger().info(
+            f"Closest LEFT rope point: dist={closest_dist_left:.4f} m, grip={grip_positions[0]}"
+        )
+        self.get_logger().info(
+            f"Closest RIGHT rope point: dist={closest_dist_right:.4f} m, grip={grip_positions[1]}"
+        )
+
+        if closest_dist_left <= 0.031 and closest_dist_right <= 0.031:
             self.grasping_procedure = True
             return
 
@@ -606,8 +584,8 @@ class RopeStateSolverNode(Node):
         if self.first_solve:
             X_in = jnp.tile(self.state[None, :], (self.N + 1, 1))
             U_in = jnp.tile(self.control0[None, :], (self.N, 1))
-            U_in = U_in.at[:30, 2].set(-0.2)
-            U_in = U_in.at[:30, 6].set(-0.2)
+            U_in = U_in.at[:, 2].set(-0.2)
+            U_in = U_in.at[:, 5].set(-0.2)
 
             # GROUND_Z = 0.0
 
@@ -638,17 +616,36 @@ class RopeStateSolverNode(Node):
             self.first_solve = False
 
         if (
-            self.latest_ee_pos_seq <= self.last_solve_latest_ee_pos_seq
-            or self.ee_base_frame_seq <= self.last_solve_ee_base_frame_seq
+            self.latest_ee_pos_seq_left
+            <= self.last_solve_latest_ee_pos_seq_left
+            or self.latest_ee_pos_seq_right
+            <= self.last_solve_latest_ee_pos_seq_right
+            or self.ee_base_frame_seq_left
+            <= self.last_solve_ee_base_frame_seq_left
+            or self.ee_base_frame_seq_right
+            <= self.last_solve_ee_base_frame_seq_right
         ):
             self.get_logger().info(
-                "Skipping solve because latest_ee_pos and/or ee_base_frame "
-                "has not updated since the last full solve."
+                "Skipping solve because one or more left/right EE poses "
+                "or base-frame poses have not updated since last solve."
             )
             return
 
-        self.last_solve_latest_ee_pos_seq = self.latest_ee_pos_seq
-        self.last_solve_ee_base_frame_seq = self.ee_base_frame_seq
+        self.last_solve_latest_ee_pos_seq_left = (
+            self.latest_ee_pos_seq_left
+        )
+
+        self.last_solve_latest_ee_pos_seq_right = (
+            self.latest_ee_pos_seq_right
+        )
+
+        self.last_solve_ee_base_frame_seq_left = (
+            self.ee_base_frame_seq_left
+        )
+
+        self.last_solve_ee_base_frame_seq_right = (
+            self.ee_base_frame_seq_right
+        )
 
         solve_start = time.time()
         out = self.controller.run(
@@ -676,8 +673,8 @@ class RopeStateSolverNode(Node):
         # control = u0_np + u1_np
         control = u0_np * 2.0
 
-        left_control = control[0:4]
-        right_control = control[4:8]
+        left_control = control[0:3]
+        right_control = control[3:6]
         # if np.linalg.norm(u0_np[:3]) <= 0.5:
         #     control += u1_np
         # control = np.clip(control, -np.asarray(self.u_max), np.asarray(self.u_max))
@@ -751,8 +748,8 @@ class RopeStateSolverNode(Node):
             f"Total callback time: {callback_time * 1000:.2f} ms"
         )
 
-        self.get_logger().info(f"u0_left: {u0_np[0:4]}")
-        self.get_logger().info(f"u0_right:  {u0_np[4:8]}")
+        self.get_logger().info(f"u0_left: {u0_np[0:3]}")
+        self.get_logger().info(f"u0_right:  {u0_np[4:6]}")
 
         self.get_logger().info(f"control_left:  {left_control}")
         self.get_logger().info(f"control_right: {right_control}")
