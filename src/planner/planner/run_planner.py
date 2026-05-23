@@ -80,7 +80,7 @@ def state_from_rope_points(
     env,
     state,
     sampled_points,
-    grip_position=None,
+    grip_positions=None,
 ):
     sampled_points = jnp.asarray(sampled_points)
 
@@ -94,19 +94,16 @@ def state_from_rope_points(
 
     x_node = sampled_points
 
-    if grip_position is not None:
-        grip_position = jnp.asarray(grip_position)
+    if grip_positions is not None:
+        grip_positions = jnp.asarray(grip_positions)
 
-        if grip_position.shape == (3,):
-            grip_position = grip_position[None, :]
-
-        if grip_position.shape != x_grip.shape:
+        if grip_positions.shape != x_grip.shape:
             raise ValueError(
-                f"grip_position shape {grip_position.shape} does not match "
+                f"grip_positions shape {grip_positions.shape} does not match "
                 f"x_grip shape {x_grip.shape}"
             )
 
-        x_grip = grip_position
+        x_grip = grip_positions
 
     new_state = jnp.concatenate(
         [
@@ -151,7 +148,8 @@ class RopeStateSolverNode(Node):
             self.get_parameter("end_effector_pose_topic").value
         )
 
-        self.latest_ee_pos = None
+        self.latest_ee_pos_left = None
+        self.latest_ee_pos_right = None
 
         self.latest_ee_pos_seq = 0
         self.ee_base_frame_seq = 0
@@ -169,7 +167,7 @@ class RopeStateSolverNode(Node):
             rope_diameter=0.01,
             youngs_modulus=1e5,
             mass_density=300,
-            num_floating_grippers=1,
+            num_floating_grippers=2,
             grip_stiffness=100,
             gripper_radius=0.02,
             contact_smoothing=1e-3,
@@ -184,7 +182,7 @@ class RopeStateSolverNode(Node):
         self.controller = None
 
         self.control0 = self.env.control(
-            c_grip=jnp.array([1.0]),
+            c_grip=jnp.array([1.0, 1.0]),
         )
 
         # x_coords = (
@@ -227,7 +225,10 @@ class RopeStateSolverNode(Node):
         )
 
         vmax = 0.2
-        self.u_max = jnp.array([vmax, vmax, vmax, 10.0])
+        self.u_max = jnp.array([
+            vmax, vmax, vmax, 10.0,
+            vmax, vmax, vmax, 10.0,
+        ])
 
         self.constraints = make_control_constraints(
             u_min=-self.u_max,
@@ -241,30 +242,56 @@ class RopeStateSolverNode(Node):
             1,
         )
 
-        self.goal_pose_pub = self.create_publisher(
+        self.goal_pose_pub_left = self.create_publisher(
             PoseStamped,
-            '/right/iiwa/goal_pose',
+            "/left/iiwa/goal_pose",
             1,
         )
 
-        self.ee_sub = self.create_subscription(
+        self.goal_pose_pub_right = self.create_publisher(
             PoseStamped,
-            self.end_effector_pose_topic,
-            self.end_effector_pose_callback,
+            "/right/iiwa/goal_pose",
             1,
         )
 
-        self.ee_base_frame_sub = self.create_subscription(
+        self.ee_sub_right = self.create_subscription(
             PoseStamped,
-            '/right/end_effector_pose',
-            self.ee_base_frame_callback,
-            1
+            "/right/workstation/end_effector_pose",
+            self.end_effector_right_pose_callback,
+            1,
         )
 
-        self.grip_pub = self.create_publisher(
+        self.ee_sub_left = self.create_subscription(
+            PoseStamped,
+            "/left/workstation/end_effector_pose",
+            self.end_effector_left_pose_callback,
+            1,
+        )
+
+        self.ee_base_frame_sub_right = self.create_subscription(
+            PoseStamped,
+            "/right/end_effector_pose",
+            self.ee_base_frame_right_callback,
+            1,
+        )
+
+        self.ee_base_frame_sub_left = self.create_subscription(
+            PoseStamped,
+            "/left/end_effector_pose",
+            self.ee_base_frame_left_callback,
+            1,
+        )
+
+        self.grip_pub_left = self.create_publisher(
             Bool,
-            '/right_grip',
-            1
+            "/left_grip",
+            1,
+        )
+
+        self.grip_pub_right = self.create_publisher(
+            Bool,
+            "/right_grip",
+            1,
         )
 
         self.get_logger().info(f"Subscribed to {self.rope_state_topic}")
@@ -272,32 +299,48 @@ class RopeStateSolverNode(Node):
         self.get_logger().info("Waiting for first real gripper pose before initializing state.")
 
         self.num_iterations = 0
-        self.ee_base_frame = None
+        self.ee_base_frame_left = None
+        self.ee_base_frame_right = None
         self.grasping_procedure = False
         self.gripper_closed = False
         self.grasing_starting_position = None
 
-    def ee_base_frame_callback(self, msg):
-        self.ee_base_frame = msg
+    def ee_base_frame_left_callback(self, msg):
+        self.ee_base_frame_left = msg
         self.ee_base_frame_seq += 1
 
-    def end_effector_pose_callback(self, msg):
+    def ee_base_frame_right_callback(self, msg):
+        self.ee_base_frame_right = msg
+        self.ee_base_frame_seq += 1
+
+    def end_effector_left_pose_callback(self, msg):
         p = np.array(
-            [
-                msg.pose.position.x,
-                msg.pose.position.y,
-                msg.pose.position.z,
-            ],
+            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
             dtype=np.float32,
         )
-
-        self.latest_ee_pos = p
+        self.latest_ee_pos_left = p
         self.latest_ee_pos_seq += 1
 
-    def get_latest_ee_pos(self):
-        if self.latest_ee_pos is None:
+
+    def end_effector_right_pose_callback(self, msg):
+        p = np.array(
+            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
+            dtype=np.float32,
+        )
+        self.latest_ee_pos_right = p
+        self.latest_ee_pos_seq += 1
+
+    def get_latest_grip_positions(self):
+        if self.latest_ee_pos_left is None or self.latest_ee_pos_right is None:
             return None
-        return self.latest_ee_pos.copy()
+
+        return np.stack(
+            [
+                self.latest_ee_pos_left,
+                self.latest_ee_pos_right,
+            ],
+            axis=0,
+        )
 
     def initialize_controller(self):
         def cost(W, reference, x, u, t):
@@ -305,8 +348,9 @@ class RopeStateSolverNode(Node):
             control_err = u - self.control0
 
             return (
-                1.0 * jnp.sum(state_err[:-3] ** 2)
-                + 0.1 * jnp.sum(control_err[:-1] ** 2)
+                1.0 * jnp.sum(state_err[:-6] ** 2)
+                + 0.1 * jnp.sum(control_err[0:3] ** 2)
+                + 0.1 * jnp.sum(control_err[4:7] ** 2)
             )
 
         def dynamics(x, u, t, parameter):
@@ -393,30 +437,69 @@ class RopeStateSolverNode(Node):
         return float(dists[seg_idx]), seg_idx, float(t[seg_idx]), closest[seg_idx]
 
     def grasp(self):
-        # This will all work in the workstation frame
-        ee_pos = self.get_latest_ee_pos()
-        if self.grasing_starting_position is None:
-            self.grasing_starting_position = self.ee_base_frame
-        
-        if ee_pos[2] <= 0.005 and not self.gripper_closed:
-            self.grip_pub.publish(Bool(data=True))
-            self.gripper_closed = True
-            self.get_logger().info("Gripping")
-            time.sleep(3)
-            self.get_logger().info("Finish Gripping")
-            return
-        
-        if not self.gripper_closed and ee_pos[2] > 0.005:
-            goal_pose = PoseStamped()
-            goal_pose.header.stamp = self.get_clock().now().to_msg()
-            goal_pose.header.frame_id = "world"
-            goal_pose.pose.position.x = float(self.grasing_starting_position.pose.position.x)
-            goal_pose.pose.position.y = float(self.grasing_starting_position.pose.position.y)
-            goal_pose.pose.position.z = float(self.ee_base_frame.pose.position.z - 0.15 * self.dt)
-            goal_pose.pose.orientation.w = 1.0
+        grip_positions = self.get_latest_grip_positions()
 
-            self.goal_pose_pub.publish(goal_pose)
+        if grip_positions is None:
+            self.get_logger().warn("Cannot grasp: missing left/right workstation EE poses.")
             return
+
+        if self.ee_base_frame_left is None or self.ee_base_frame_right is None:
+            self.get_logger().warn("Cannot grasp: missing left/right base-frame EE poses.")
+            return
+
+        left_ee_pos = grip_positions[0]
+        right_ee_pos = grip_positions[1]
+
+        if self.grasing_starting_position is None:
+            self.grasing_starting_position = {
+                "left": self.ee_base_frame_left,
+                "right": self.ee_base_frame_right,
+            }
+
+        left_at_ground = left_ee_pos[2] <= 0.005
+        right_at_ground = right_ee_pos[2] <= 0.005
+
+        if left_at_ground and right_at_ground and not self.gripper_closed:
+            self.grip_pub_left.publish(Bool(data=True))
+            self.grip_pub_right.publish(Bool(data=True))
+
+            self.gripper_closed = True
+            self.get_logger().info("Closing both grippers")
+            time.sleep(3)
+            self.get_logger().info("Finished closing both grippers")
+            return
+
+        if not self.gripper_closed:
+            left_goal_pose = PoseStamped()
+            left_goal_pose.header.stamp = self.get_clock().now().to_msg()
+            left_goal_pose.header.frame_id = "world"
+            left_goal_pose.pose.position.x = float(
+                self.grasing_starting_position["left"].pose.position.x
+            )
+            left_goal_pose.pose.position.y = float(
+                self.grasing_starting_position["left"].pose.position.y
+            )
+            left_goal_pose.pose.position.z = float(
+                self.ee_base_frame_left.pose.position.z - 0.15 * self.dt
+            )
+            left_goal_pose.pose.orientation.w = 1.0
+
+            right_goal_pose = PoseStamped()
+            right_goal_pose.header.stamp = self.get_clock().now().to_msg()
+            right_goal_pose.header.frame_id = "world"
+            right_goal_pose.pose.position.x = float(
+                self.grasing_starting_position["right"].pose.position.x
+            )
+            right_goal_pose.pose.position.y = float(
+                self.grasing_starting_position["right"].pose.position.y
+            )
+            right_goal_pose.pose.position.z = float(
+                self.ee_base_frame_right.pose.position.z - 0.15 * self.dt
+            )
+            right_goal_pose.pose.orientation.w = 1.0
+
+            self.goal_pose_pub_left.publish(left_goal_pose)
+            self.goal_pose_pub_right.publish(right_goal_pose)
         
 
     def rope_state_callback(self, msg):
@@ -433,7 +516,7 @@ class RopeStateSolverNode(Node):
             self.get_logger().info("Done")
             return
 
-        if self.ee_base_frame is None:
+        if self.ee_base_frame_right is None or self.ee_base_frame_left is None:
             self.get_logger().info("No ee base frame pose")
             return
 
@@ -441,10 +524,10 @@ class RopeStateSolverNode(Node):
             self.get_logger().info("Skipping, no poses")
             return
 
-        ee_pos = self.get_latest_ee_pos()
+        grip_positions = self.get_latest_grip_positions()
 
-        if ee_pos is None:
-            self.get_logger().warn("No end effector pose yet. Skipping solve.")
+        if grip_positions is None:
+            self.get_logger().warn("No left/right end effector poses yet. Skipping solve.")
             return
 
         callback_start = time.time()
@@ -468,7 +551,7 @@ class RopeStateSolverNode(Node):
         )
 
         closest_dist, closest_seg_idx, closest_t, closest_point = (
-            self.closest_point_on_rope_segments(sampled, ee_pos)
+            self.closest_point_on_rope_segments(sampled, grip_positions[0])
         )
 
         self.get_logger().info(
@@ -477,7 +560,7 @@ class RopeStateSolverNode(Node):
             f"segment={closest_seg_idx}->{closest_seg_idx + 1}, "
             f"t={closest_t:.3f}, "
             f"point={closest_point}, "
-            f"grip={ee_pos}"
+            f"grip={grip_positions[0]}"
         )
 
         if closest_dist <= 0.031:
@@ -489,19 +572,14 @@ class RopeStateSolverNode(Node):
             return
 
         if self.state is None:
-            ee_grip = jnp.asarray(ee_pos)
-
-            if ee_grip.shape == (3,):
-                ee_grip = ee_grip[None, :]
-
-            self.x_grip = ee_grip
+            self.x_grip = jnp.asarray(grip_positions)
             self.state = self.env.state(x_grip=self.x_grip)
 
             self.state = state_from_rope_points(
                 self.env,
                 self.state,
                 sampled,
-                grip_position=ee_pos,
+                grip_positions=grip_positions,
             )
 
             self.get_logger().info(
@@ -510,15 +588,13 @@ class RopeStateSolverNode(Node):
         else:
             x_node, x_weld, x_grip = self.env.unpack_state(self.state)
 
-            ee_grip = jnp.asarray(ee_pos)
-            if ee_grip.shape == (3,):
-                ee_grip = ee_grip[None, :]
+            grip_positions_jnp = jnp.asarray(grip_positions)
 
             self.state = jnp.concatenate(
                 [
-                    x_node.reshape(-1),      # keep first rope constant
+                    x_node.reshape(-1),
                     x_weld.reshape(-1),
-                    ee_grip.reshape(-1),     # update manipulator/gripper state
+                    grip_positions_jnp.reshape(-1),
                 ]
             )
 
@@ -531,6 +607,7 @@ class RopeStateSolverNode(Node):
             X_in = jnp.tile(self.state[None, :], (self.N + 1, 1))
             U_in = jnp.tile(self.control0[None, :], (self.N, 1))
             U_in = U_in.at[:30, 2].set(-0.2)
+            U_in = U_in.at[:30, 6].set(-0.2)
 
             # GROUND_Z = 0.0
 
@@ -597,42 +674,89 @@ class RopeStateSolverNode(Node):
         u1_np = np.clip(u1_np, -np.asarray(self.u_max), np.asarray(self.u_max))
         # control = u0_np * 1.0
         # control = u0_np + u1_np
-        control = u0_np * 2
+        control = u0_np * 2.0
+
+        left_control = control[0:4]
+        right_control = control[4:8]
         # if np.linalg.norm(u0_np[:3]) <= 0.5:
         #     control += u1_np
         # control = np.clip(control, -np.asarray(self.u_max), np.asarray(self.u_max))
         callback_time = time.time() - callback_start
 
-        goal_pose = PoseStamped()
-        goal_pose.header.stamp = self.get_clock().now().to_msg()
-        goal_pose.header.frame_id = "world"
-        goal_pose.pose.position.x = float(self.ee_base_frame.pose.position.x + control[0] * self.dt)
-        goal_pose.pose.position.y = float(self.ee_base_frame.pose.position.y + control[1] * self.dt)
-        goal_pose.pose.position.z = float(self.ee_base_frame.pose.position.z + control[2] * self.dt)
-        goal_pose.pose.orientation.w = 1.0
 
-        self.num_iterations += 1
-        self.goal_pose_pub.publish(goal_pose)
+        left_goal_pose = PoseStamped()
+        left_goal_pose.header.stamp = self.get_clock().now().to_msg()
+        left_goal_pose.header.frame_id = "world"
+        left_goal_pose.pose.position.x = float(
+            self.ee_base_frame_left.pose.position.x + left_control[0] * self.dt
+        )
+        left_goal_pose.pose.position.y = float(
+            self.ee_base_frame_left.pose.position.y + left_control[1] * self.dt
+        )
+        left_goal_pose.pose.position.z = float(
+            self.ee_base_frame_left.pose.position.z + left_control[2] * self.dt
+        )
+        left_goal_pose.pose.orientation.w = 1.0
+
+        right_goal_pose = PoseStamped()
+        right_goal_pose.header.stamp = self.get_clock().now().to_msg()
+        right_goal_pose.header.frame_id = "world"
+        right_goal_pose.pose.position.x = float(
+            self.ee_base_frame_right.pose.position.x + right_control[0] * self.dt
+        )
+        right_goal_pose.pose.position.y = float(
+            self.ee_base_frame_right.pose.position.y + right_control[1] * self.dt
+        )
+        right_goal_pose.pose.position.z = float(
+            self.ee_base_frame_right.pose.position.z + right_control[2] * self.dt
+        )
+        right_goal_pose.pose.orientation.w = 1.0
+
+        self.goal_pose_pub_left.publish(left_goal_pose)
+        self.goal_pose_pub_right.publish(right_goal_pose)
 
         self.get_logger().info("=" * 80)
+
         self.get_logger().info(
-            f"Publishing goal pose "
-            f"x={ee_pos[0] + control[0] * self.dt} "
-            f"y={ee_pos[1] + control[1] * self.dt} "
-            f"z={ee_pos[2] + control[2] * self.dt}"
+            f"LEFT goal pose: "
+            f"x={self.ee_base_frame_left.pose.position.x + left_control[0] * self.dt:.4f} "
+            f"y={self.ee_base_frame_left.pose.position.y + left_control[1] * self.dt:.4f} "
+            f"z={self.ee_base_frame_left.pose.position.z + left_control[2] * self.dt:.4f}"
         )
+
+        self.get_logger().info(
+            f"RIGHT goal pose: "
+            f"x={self.ee_base_frame_right.pose.position.x + right_control[0] * self.dt:.4f} "
+            f"y={self.ee_base_frame_right.pose.position.y + right_control[1] * self.dt:.4f} "
+            f"z={self.ee_base_frame_right.pose.position.z + right_control[2] * self.dt:.4f}"
+        )
+
         self.get_logger().info(
             f"Received rope_state with {raw_points.shape[0]} raw points"
         )
-        self.get_logger().info(f"Current EE pos: {ee_pos}")
+
+        self.get_logger().info(
+            f"Current LEFT EE pos: {grip_positions[0]}"
+        )
+
+        self.get_logger().info(
+            f"Current RIGHT EE pos: {grip_positions[1]}"
+        )
+
         self.get_logger().info(
             f"MPC solve time: {solve_time * 1000:.2f} ms"
         )
+
         self.get_logger().info(
             f"Total callback time: {callback_time * 1000:.2f} ms"
         )
-        self.get_logger().info(f"u0: {u0_np}")
-        self.get_logger().info(f"control: {control}")
+
+        self.get_logger().info(f"u0_left: {u0_np[0:4]}")
+        self.get_logger().info(f"u0_right:  {u0_np[4:8]}")
+
+        self.get_logger().info(f"control_left:  {left_control}")
+        self.get_logger().info(f"control_right: {right_control}")
+
         self.get_logger().info("=" * 80)
         # time.sleep(0.01)
 

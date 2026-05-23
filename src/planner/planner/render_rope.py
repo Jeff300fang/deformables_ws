@@ -35,23 +35,18 @@ class RopePoseSimRenderer(Node):
         self.declare_parameter("rope_poses_topic", "/rope_poses")
         self.declare_parameter("num_segments", 10)
         self.declare_parameter("rope_diameter", 0.01)
-        self.declare_parameter(
-            "end_effector_pose_topic",
-            "/right/workstation/end_effector_pose",
-        )
         self.declare_parameter("save_path", "saved_rope_state.npy")
 
         self.rope_poses_topic = str(self.get_parameter("rope_poses_topic").value)
         self.num_segments = int(self.get_parameter("num_segments").value)
         self.rope_diameter = float(self.get_parameter("rope_diameter").value)
-        self.end_effector_pose_topic = str(
-            self.get_parameter("end_effector_pose_topic").value
-        )
         self.save_path = str(self.get_parameter("save_path").value)
 
-        self.latest_points = None
-        self.latest_ee_pos = None
         self.lock = threading.Lock()
+
+        self.latest_points = None
+        self.latest_ee_pos_left = None
+        self.latest_ee_pos_right = None
 
         self.sub = self.create_subscription(
             PoseArray,
@@ -60,18 +55,21 @@ class RopePoseSimRenderer(Node):
             10,
         )
 
-        self.ee_sub = self.create_subscription(
+        self.ee_sub_right = self.create_subscription(
             PoseStamped,
-            self.end_effector_pose_topic,
-            self.end_effector_pose_callback,
+            "/right/workstation/end_effector_pose",
+            self.end_effector_right_pose_callback,
             10,
         )
 
-        self.get_logger().info(f"Subscribed to {self.rope_poses_topic}")
-        self.get_logger().info(f"Subscribed to {self.end_effector_pose_topic}")
-        self.get_logger().info(f"Will save state once to {self.save_path}")
+        self.ee_sub_left = self.create_subscription(
+            PoseStamped,
+            "/left/workstation/end_effector_pose",
+            self.end_effector_left_pose_callback,
+            10,
+        )
 
-    def end_effector_pose_callback(self, msg):
+    def end_effector_right_pose_callback(self, msg):
         p = np.array(
             [
                 msg.pose.position.x,
@@ -82,13 +80,42 @@ class RopePoseSimRenderer(Node):
         )
 
         with self.lock:
-            self.latest_ee_pos = p
+            self.latest_ee_pos_right = p
 
-    def get_latest_ee_pos(self):
+    def end_effector_left_pose_callback(self, msg):
+        p = np.array(
+            [
+                msg.pose.position.x,
+                msg.pose.position.y,
+                msg.pose.position.z,
+            ],
+            dtype=np.float32,
+        )
+
         with self.lock:
-            if self.latest_ee_pos is None:
+            self.latest_ee_pos_left = p
+
+    def get_latest_points(self):
+        with self.lock:
+            if self.latest_points is None:
                 return None
-            return self.latest_ee_pos.copy()
+            return self.latest_points.copy()
+
+    def get_latest_grip_positions(self):
+        with self.lock:
+            if (
+                self.latest_ee_pos_left is None
+                or self.latest_ee_pos_right is None
+            ):
+                return None
+
+            return np.stack(
+                [
+                    self.latest_ee_pos_left,
+                    self.latest_ee_pos_right,
+                ],
+                axis=0,
+            )
 
     def rope_poses_callback(self, msg):
         if len(msg.poses) == 0:
@@ -122,18 +149,12 @@ class RopePoseSimRenderer(Node):
 
         self.get_logger().info(f"Received {len(points)} rope poses")
 
-    def get_latest_points(self):
-        with self.lock:
-            if self.latest_points is None:
-                return None
-            return self.latest_points.copy()
-
 
 def state_from_rope_points(
     env,
     state,
     sampled_points,
-    grip_position=None,
+    grip_positions=None,
 ):
     sampled_points = jnp.asarray(sampled_points)
 
@@ -147,19 +168,16 @@ def state_from_rope_points(
 
     x_node = sampled_points
 
-    if grip_position is not None:
-        grip_position = jnp.asarray(grip_position)
+    if grip_positions is not None:
+        grip_positions = jnp.asarray(grip_positions)
 
-        if grip_position.shape == (3,):
-            grip_position = grip_position[None, :]
-
-        if grip_position.shape != x_grip.shape:
+        if grip_positions.shape != x_grip.shape:
             raise ValueError(
-                f"grip_position shape {grip_position.shape} does not match "
+                f"grip_positions shape {grip_positions.shape} does not match "
                 f"x_grip shape {x_grip.shape}"
             )
 
-        x_grip = grip_position
+        x_grip = grip_positions
 
     new_state = jnp.concatenate(
         [
@@ -200,17 +218,17 @@ def resample_fixed_link_length_extend(points, num_points, link_length=0.1):
             new_p = last + link_length * direction
             sampled.append(new_p.astype(np.float32))
             last = new_p.astype(np.float32)
-            # do not increment i
         else:
             i += 1
 
-    # If observed rope ended early, extend straight using last direction
     if len(sampled) < num_points:
         if last_dir is None:
             v = points[-1] - points[-2]
             norm = np.linalg.norm(v)
+
             if norm < 1e-8:
                 return None
+
             last_dir = v / norm
 
         while len(sampled) < num_points:
@@ -226,7 +244,7 @@ def save_state_once(
     state,
     rope_points,
     sampled_rope_points,
-    grip_position,
+    grip_positions,
     already_saved,
 ):
     if already_saved:
@@ -238,14 +256,14 @@ def save_state_once(
     if sampled_rope_points is None:
         return False
 
-    if grip_position is None:
+    if grip_positions is None:
         return False
 
     save_data = {
         "state": np.asarray(state),
         "rope_points_raw": np.asarray(rope_points),
         "rope_points_sampled": np.asarray(sampled_rope_points),
-        "grip_position": np.asarray(grip_position),
+        "grip_positions": np.asarray(grip_positions),
         "timestamp": time.time(),
     }
 
@@ -278,13 +296,19 @@ def main(args=None):
         rope_diameter=0.01,
         youngs_modulus=1e5,
         mass_density=300,
-        num_floating_grippers=1,
+        num_floating_grippers=2,
         grip_stiffness=300,
         gripper_radius=0.05,
         contact_smoothing=3e-3,
     )
 
-    x_grip = jnp.array([[0.05, 0.2 / jnp.pi, 0.002]])
+    x_grip = jnp.array(
+        [
+            [0.05, -0.10, 0.002],
+            [0.05,  0.10, 0.002],
+        ]
+    )
+
     state = env.state(x_grip=x_grip)
 
     env.visualize(server, state)
@@ -295,21 +319,18 @@ def main(args=None):
         while rclpy.ok():
             start = time.time()
 
-            ee_pos = node.get_latest_ee_pos()
+            grip_positions = node.get_latest_grip_positions()
 
-            if ee_pos is not None:
+            if grip_positions is not None:
                 x_node, x_weld, x_grip = env.unpack_state(state)
 
-                ee_grip = jnp.asarray(ee_pos)
-
-                if ee_grip.shape == (3,):
-                    ee_grip = ee_grip[None, :]
+                grip_positions_jnp = jnp.asarray(grip_positions)
 
                 state = jnp.concatenate(
                     [
                         x_node.reshape(-1),
                         x_weld.reshape(-1),
-                        ee_grip.reshape(-1),
+                        grip_positions_jnp.reshape(-1),
                     ]
                 )
 
@@ -325,12 +346,12 @@ def main(args=None):
 
                 if sampled is not None:
                     sampled_jnp = jnp.asarray(sampled)
-                    # print("State shape:", state.shape)
+
                     state = state_from_rope_points(
                         env,
                         state,
                         sampled_jnp,
-                        grip_position=ee_pos,
+                        grip_positions=grip_positions,
                     )
 
             saved_state = save_state_once(
@@ -339,7 +360,7 @@ def main(args=None):
                 state=state,
                 rope_points=points,
                 sampled_rope_points=sampled,
-                grip_position=ee_pos,
+                grip_positions=grip_positions,
                 already_saved=saved_state,
             )
 
