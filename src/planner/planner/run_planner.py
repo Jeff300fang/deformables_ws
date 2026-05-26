@@ -682,6 +682,8 @@ class RopeStateSolverNode(Node):
         self.get_logger().info("Waiting for first real gripper pose before initializing state.")
 
         self.num_iterations = 0
+        self.solve_save_dir = Path.cwd() / "rope_mpc_solves"
+        self.solve_save_dir.mkdir(parents=True, exist_ok=True)
         self.ee_base_frame_left = None
         self.ee_base_frame_right = None
         self.left_grasping_procedure = False
@@ -1100,7 +1102,7 @@ class RopeStateSolverNode(Node):
             time.sleep(0.01)
             return
 
-        if self.num_iterations >= 300:
+        if self.num_iterations >= 1000:
             self.get_logger().info("Done")
             return
 
@@ -1148,10 +1150,6 @@ class RopeStateSolverNode(Node):
                 raw_points,
                 self.env.params.num_nodes,
                 link_length=0.1,
-                grip_positions=grip_positions,
-            )
-            grip_positions = project_grippers_to_nearest_rope_points(
-                sampled_points=sampled,
                 grip_positions=grip_positions,
             )
 
@@ -1247,6 +1245,11 @@ class RopeStateSolverNode(Node):
                 num_points=self.env.params.num_nodes,
                 spacing=self.env.params.segment_length,
             )
+
+            grip_positions = project_grippers_to_nearest_rope_points(
+                sampled_points=sampled,
+                grip_positions=grip_positions,
+            )
             
             alpha = 0.7
             if self.prev_sampled is not None:
@@ -1319,7 +1322,7 @@ class RopeStateSolverNode(Node):
         self.last_solve_ee_base_frame_seq_right = (
             self.ee_base_frame_seq_right
         )
-
+        self.controller.U0 = self.controller.U0.at[:, -2:].set(1.0)
         solve_start = time.time()
         out = self.controller.run(
             x0=self.state,
@@ -1332,6 +1335,22 @@ class RopeStateSolverNode(Node):
 
         X_sol = out[1]
         U_sol = out[2]
+
+        save_path = self.solve_save_dir / f"solve_{self.num_iterations:05d}.npz"
+        self.num_iterations += 1
+        np.savez_compressed(
+            save_path,
+            iteration=np.array(self.num_iterations),
+            state=np.asarray(self.state),
+            X=np.asarray(X_sol),
+            U=np.asarray(U_sol),
+            solve_time=np.array(solve_time),
+            in_contact=np.array(self.in_contact),
+            left_ee_pos=np.asarray(self.latest_ee_pos_left),
+            right_ee_pos=np.asarray(self.latest_ee_pos_right),
+        )
+
+        self.get_logger().info(f"Saved solve debug data to {save_path}")
 
         U_sol.block_until_ready()
 
