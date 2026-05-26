@@ -27,6 +27,168 @@ sys.path.insert(0, str(JAX_DEFORMABLES_PATH))
 from environments import RopeEnv
 from planners import gpu_sls
 
+def teleport_rope_closest_points_rigid(sampled_points, grip_positions):
+    sampled_points = np.asarray(sampled_points, dtype=np.float32)
+    grip_positions = np.asarray(grip_positions, dtype=np.float32)
+
+    if sampled_points is None or grip_positions is None:
+        return sampled_points
+
+    # closest rope node to each gripper
+    closest_idxs = []
+    closest_points = []
+
+    for grip_pos in grip_positions:
+        dists = np.linalg.norm(sampled_points - grip_pos[None, :], axis=1)
+        idx = int(np.argmin(dists))
+        closest_idxs.append(idx)
+        closest_points.append(sampled_points[idx])
+
+    src = np.asarray(closest_points, dtype=np.float32)
+    dst = grip_positions.astype(np.float32)
+
+    src_center = np.mean(src, axis=0)
+    dst_center = np.mean(dst, axis=0)
+
+    src_vec = src[1] - src[0]
+    dst_vec = dst[1] - dst[0]
+
+    src_norm = np.linalg.norm(src_vec)
+    dst_norm = np.linalg.norm(dst_vec)
+
+    if src_norm < 1e-8 or dst_norm < 1e-8:
+        # fallback: translation only
+        offset = dst_center - src_center
+        return (sampled_points + offset).astype(np.float32)
+
+    a = src_vec / src_norm
+    b = dst_vec / dst_norm
+
+    v = np.cross(a, b)
+    c = np.dot(a, b)
+    s = np.linalg.norm(v)
+
+    if s < 1e-8:
+        if c > 0:
+            R = np.eye(3, dtype=np.float32)
+        else:
+            # 180 degree rotation around any axis perpendicular to a
+            tmp = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if abs(np.dot(tmp, a)) > 0.9:
+                tmp = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+            axis = np.cross(a, tmp)
+            axis = axis / np.linalg.norm(axis)
+
+            K = np.array(
+                [
+                    [0.0, -axis[2], axis[1]],
+                    [axis[2], 0.0, -axis[0]],
+                    [-axis[1], axis[0], 0.0],
+                ],
+                dtype=np.float32,
+            )
+
+            R = np.eye(3, dtype=np.float32) + 2.0 * (K @ K)
+    else:
+        K = np.array(
+            [
+                [0.0, -v[2], v[1]],
+                [v[2], 0.0, -v[0]],
+                [-v[1], v[0], 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        R = (
+            np.eye(3, dtype=np.float32)
+            + K
+            + K @ K * ((1.0 - c) / (s**2))
+        )
+
+    teleported = (sampled_points - src_center) @ R.T + dst_center
+    return teleported.astype(np.float32)
+
+def teleport_rope_closest_points_shear(sampled_points, grip_positions):
+    pts = np.asarray(sampled_points, dtype=np.float32).copy()
+    grips = np.asarray(grip_positions, dtype=np.float32)
+
+    # arc-length parameter along rope
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+    s_nodes = np.concatenate([[0.0], np.cumsum(seg_len)])
+
+    anchors_s = []
+    anchors_delta = []
+
+    for g in grips:
+        # closest point on rope segments
+        a = pts[:-1]
+        b = pts[1:]
+        ab = b - a
+        ab_len2 = np.sum(ab * ab, axis=1)
+
+        t = np.sum((g[None, :] - a) * ab, axis=1) / np.maximum(ab_len2, 1e-12)
+        t = np.clip(t, 0.0, 1.0)
+
+        closest = a + t[:, None] * ab
+        d = np.linalg.norm(closest - g[None, :], axis=1)
+
+        k = int(np.argmin(d))
+        s_anchor = s_nodes[k] + t[k] * seg_len[k]
+        delta = g - closest[k]
+
+        anchors_s.append(s_anchor)
+        anchors_delta.append(delta)
+
+    s0, s1 = anchors_s
+    d0, d1 = anchors_delta
+
+    if abs(s1 - s0) < 1e-8:
+        return pts
+
+    # Linear shear field along rope arc length.
+    # This guarantees:
+    #   rope(s0) -> left gripper
+    #   rope(s1) -> right gripper
+    w1 = (s_nodes - s0) / (s1 - s0)
+    w0 = 1.0 - w1
+
+    displacement = w0[:, None] * d0[None, :] + w1[:, None] * d1[None, :]
+    return (pts + displacement).astype(np.float32)
+
+def resample_fixed_spacing(points, num_points, spacing=0.1):
+    pts = np.asarray(points, dtype=np.float32)
+
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+
+    s = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total_len = s[-1]
+
+    # exactly num_points samples
+    new_s = np.arange(num_points, dtype=np.float32) * spacing
+
+    new_pts = []
+    j = 0
+
+    for target in new_s:
+        if target <= total_len:
+            while j < len(s) - 2 and s[j + 1] < target:
+                j += 1
+
+            denom = max(s[j + 1] - s[j], 1e-8)
+            t = (target - s[j]) / denom
+            p = (1 - t) * pts[j] + t * pts[j + 1]
+        else:
+            # extend past observed curve if needed
+            direction = pts[-1] - pts[-2]
+            direction = direction / max(np.linalg.norm(direction), 1e-8)
+            p = pts[-1] + (target - total_len) * direction
+
+        new_pts.append(p.astype(np.float32))
+
+    return np.asarray(new_pts, dtype=np.float32)
 
 def resample_fixed_link_length_extend(points, num_points, link_length=0.1):
     points = np.asarray(points, dtype=np.float32)
@@ -75,6 +237,93 @@ def resample_fixed_link_length_extend(points, num_points, link_length=0.1):
 
     return np.asarray(sampled, dtype=np.float32)
 
+def parabola_obstacle_z(x, x_center, z_base, height, half_width):
+    u = (x - x_center) / max(half_width, 1e-8)
+    return z_base + height * (1.0 - u * u)
+
+def resample_fixed_link_length_extend_lr(
+    points,
+    num_points,
+    link_length=0.1,
+    grip_positions=None,
+):
+    points = np.asarray(points, dtype=np.float32)
+
+    if points.shape[0] < 2:
+        return None
+
+    # grip_positions is expected as [left_grip, right_grip]
+    if grip_positions is not None:
+        grip_positions = np.asarray(grip_positions, dtype=np.float32)
+        left_grip = grip_positions[0]
+        right_grip = grip_positions[1]
+
+        # Make point order deterministic:
+        # points[0] should be the rope end closer to the left gripper.
+        d_start_left = np.linalg.norm(points[0] - left_grip)
+        d_end_left = np.linalg.norm(points[-1] - left_grip)
+
+        if d_end_left < d_start_left:
+            points = points[::-1].copy()
+
+    # First do normal fixed-link resampling from left to right.
+    sampled = [points[0].copy()]
+    last = points[0].astype(np.float32)
+
+    i = 1
+    while i < len(points) and len(sampled) < num_points:
+        p = points[i]
+        v = p - last
+        dist = np.linalg.norm(v)
+
+        if dist < 1e-8:
+            i += 1
+            continue
+
+        direction = v / dist
+
+        if dist >= link_length:
+            new_p = last + link_length * direction
+            sampled.append(new_p.astype(np.float32))
+            last = new_p.astype(np.float32)
+        else:
+            i += 1
+
+    if len(sampled) < 2:
+        return None
+
+    # Extend deterministically:
+    # left, right, left, right, ...
+    extend_left_next = True
+
+    while len(sampled) < num_points:
+        if extend_left_next:
+            # Outward direction from second node toward first node.
+            v = sampled[0] - sampled[1]
+            norm = np.linalg.norm(v)
+
+            if norm < 1e-8:
+                return None
+
+            direction = v / norm
+            new_p = sampled[0] + link_length * direction
+            sampled.insert(0, new_p.astype(np.float32))
+
+        else:
+            # Outward direction from second-last node toward last node.
+            v = sampled[-1] - sampled[-2]
+            norm = np.linalg.norm(v)
+
+            if norm < 1e-8:
+                return None
+
+            direction = v / norm
+            new_p = sampled[-1] + link_length * direction
+            sampled.append(new_p.astype(np.float32))
+
+        extend_left_next = not extend_left_next
+
+    return np.asarray(sampled, dtype=np.float32)
 
 def state_from_rope_points(
     env,
@@ -115,7 +364,18 @@ def state_from_rope_points(
 
     return new_state
 
+def project_grippers_to_nearest_rope_points(sampled_points, grip_positions):
+    pts = np.asarray(sampled_points, dtype=np.float32)
+    grips = np.asarray(grip_positions, dtype=np.float32).copy()
 
+    new_grips = []
+
+    for grip in grips:
+        dists = np.linalg.norm(pts - grip[None, :], axis=1)
+        idx = int(np.argmin(dists))
+        new_grips.append(pts[idx])
+
+    return np.asarray(new_grips, dtype=np.float32)
 
 def make_control_constraints(u_min, u_max):
     def constraints(x, u, t):
@@ -132,6 +392,85 @@ def make_constant_disturbance(alpha):
 
     return disturbance
 
+def make_control_and_obstacle_constraints(
+    env,
+    u_min: jnp.ndarray,
+    u_max: jnp.ndarray,
+    cone_centers_xy: jnp.ndarray,
+    cone_radius: float,
+    cone_z_top: float,
+    num_edge_samples: int = 5,
+):
+    def constraints(x, u, t):
+        control_constraints = jnp.concatenate((u - u_max, u_min - u))
+
+        rope_nodes, _, gripper_pos = env.unpack_state(x)
+
+        left_pos, right_pos = gripper_pos[0], gripper_pos[1]
+        effector_constraints = jnp.array([-left_pos[1], right_pos[1]])
+
+        # --------------------------------------------------
+        # Sample actual rope nodes + points between nodes
+        # --------------------------------------------------
+        node_pts = rope_nodes
+
+        a = rope_nodes[:-1]
+        b = rope_nodes[1:]
+
+        alphas = jnp.linspace(
+            0.0,
+            1.0,
+            num_edge_samples + 2,
+        )[1:-1]
+
+        edge_pts = (
+            a[:, None, :] * (1.0 - alphas[None, :, None])
+            + b[:, None, :] * alphas[None, :, None]
+        ).reshape(-1, 3)
+
+        pts = jnp.concatenate([node_pts, edge_pts], axis=0)
+
+        pt_xy = pts[:, 0:2]
+        pt_z = pts[:, 2]
+
+        # --------------------------------------------------
+        # Cone obstacle constraints on all sampled rope points
+        # constraint <= 0 is feasible
+        # --------------------------------------------------
+        obstacle_constraints = []
+
+        for cone_center_xy in cone_centers_xy:
+            radial_dist = jnp.linalg.norm(
+                pt_xy - cone_center_xy[None, :],
+                axis=1,
+            )
+
+            z_required = cone_z_top * jnp.maximum(
+                1.0 - radial_dist / cone_radius,
+                0.0,
+            )
+
+            cone_constraints = z_required - pt_z
+
+            cone_constraints = jnp.where(
+                radial_dist <= cone_radius,
+                cone_constraints,
+                -1.0,
+            )
+
+            obstacle_constraints.append(cone_constraints)
+
+        obstacle_constraints = jnp.concatenate(obstacle_constraints)
+
+        return jnp.concatenate(
+            (
+                control_constraints,
+                effector_constraints,
+                obstacle_constraints,
+            )
+        )
+
+    return constraints
 
 class RopeStateSolverNode(Node):
     def __init__(self):
@@ -155,8 +494,42 @@ class RopeStateSolverNode(Node):
         self.last_solve_ee_base_frame_seq_left = -1
         self.last_solve_ee_base_frame_seq_right = -1
 
+        self.cone_obstacle_x_center = 0.05
+        self.cone_obstacle_y_center = 0.0
+        self.cone_obstacle_z_base = 0.0
+        self.cone_obstacle_height = 0.15
+        self.cone_obstacle_radius = 0.1
+        self.cone_obstacle_clearance = 0.03
+
         self.server = viser.ViserServer()
         _ = self.server.scene.add_grid(name="ground")
+
+        rs = np.linspace(0.0, self.cone_obstacle_radius, 30)
+        thetas = np.linspace(0.0, 2.0 * np.pi, 80)
+
+        obstacle_pts = []
+
+        for r in rs:
+            z = self.cone_obstacle_z_base + self.cone_obstacle_height * (
+                1.0 - r / max(self.cone_obstacle_radius, 1e-8)
+            )
+
+            for theta in thetas:
+                x = self.cone_obstacle_x_center + r * np.cos(theta)
+                y = self.cone_obstacle_y_center + r * np.sin(theta)
+                obstacle_pts.append([x, y, z])
+
+        obstacle_pts = np.asarray(obstacle_pts, dtype=np.float32)
+
+        self.server.scene.add_point_cloud(
+            name="/cone_obstacle",
+            points=obstacle_pts,
+            colors=np.tile(
+                np.array([[255, 80, 80]], dtype=np.uint8),
+                (obstacle_pts.shape[0], 1),
+            ),
+            point_size=0.01,
+        )
 
         self.env = RopeEnv(
             time_step=0.02,
@@ -170,8 +543,10 @@ class RopeStateSolverNode(Node):
             gripper_radius=0.02,
             contact_smoothing=3e-3,
         )
+        self.prev_U_solved = None
+        self.prev_X_solved = None
 
-        self.N = 50
+        self.N = 30
         self.dt = self.env.params.dt
 
         self.x_grip = None
@@ -183,33 +558,65 @@ class RopeStateSolverNode(Node):
             c_grip=jnp.array([1.0, 1.0]),
         )
 
+        self.state_goals = []
+
+        # Subgoal #1, go down and pick up rope
+        # y_coords = (
+        #     jnp.arange(self.env.params.num_nodes) * self.env.params.segment_length
+        #     - 0.5
+        # )
+
+        # z_coords = jnp.ones(self.env.params.num_nodes) * 0.05
+
+        # nodes = jnp.stack(
+        #     (
+        #         jnp.zeros_like(y_coords),  # x
+        #         y_coords,                  # y
+        #         z_coords,                  # z
+        #     ),
+        #     axis=1,
+        # )
+
+        # self.state_goals.append(self.env.state(x_node=nodes))
+        self.state_goals.append(None)
+
+        # Subgoal #2, raise rope to 0.15
         y_coords = (
             jnp.arange(self.env.params.num_nodes) * self.env.params.segment_length
             - 0.5
         )
-
-        z_coords = jnp.ones(self.env.params.num_nodes) * 0.05
+        # Starting Left EE: x=0.25, y=0.35, z=0.08
+        # Starting Right EE: x=0.25, y=-0.38, z=0.12
+        # Goal Left EE: x=-0.13, y=0.35, z=0.08
+        # Goal Right EE: x=-0.13, y=-0.38, z=0.12
+        # right ee end: -0.15, -0.35, z=0.18
+        x_coords = jnp.ones(self.env.params.num_nodes) * -0.13
+        z_coords = jnp.ones(self.env.params.num_nodes) * 0.15
 
         nodes = jnp.stack(
             (
-                jnp.zeros_like(y_coords),  # x
-                y_coords,                  # y
+                x_coords,                  # x
+                y_coords[::-1],            # y
                 z_coords,                  # z
             ),
             axis=1,
         )
-
-        self.state_goal = self.env.state(
-            x_node=nodes,
-        )
+        self.state_goals.append(self.env.state(x_node=nodes))
 
         vmax = 0.2
         u_max = jnp.array([vmax, vmax, vmax, 10.0])
         self.u_max = jnp.repeat(u_max, 2)
 
-        self.constraints = make_control_constraints(
+        self.constraints = make_control_and_obstacle_constraints(
+            env=self.env,
             u_min=-self.u_max,
             u_max=self.u_max,
+            cone_centers_xy=jnp.array([
+                [self.cone_obstacle_x_center,
+                self.cone_obstacle_y_center]
+            ]),
+            cone_radius=self.cone_obstacle_radius,
+            cone_z_top=self.cone_obstacle_height,
         )
 
         self.sub = self.create_subscription(
@@ -277,9 +684,31 @@ class RopeStateSolverNode(Node):
         self.num_iterations = 0
         self.ee_base_frame_left = None
         self.ee_base_frame_right = None
-        self.grasping_procedure = False
-        self.gripper_closed = False
-        self.grasing_starting_position = None
+        self.left_grasping_procedure = False
+        self.right_grasping_procedure = False
+
+        self.left_gripper_closed = False
+        self.right_gripper_closed = False
+        self.grasping_starting_position_left = None
+        self.grasping_starting_position_right = None
+
+        self.grip_activation_dist = 0.035
+        self.grip_ground_z = 0.005
+        self.grip_down_speed = 0.15
+
+        self.in_contact = False
+        self.prev_sampled = None
+        self.reference = None
+        self.grasp_reference_sampled = None
+        self.visualize_rollouts_enabled = True
+
+        self.post_grasp_lift_active = False
+        self.post_grasp_lift_height = 0.05  # 5 cm
+        self.post_grasp_lift_speed = 0.15
+
+        self.left_lift_start_z = None
+        self.right_lift_start_z = None
+
 
     def ee_base_frame_left_callback(self, msg):
         self.ee_base_frame_left = msg
@@ -321,13 +750,22 @@ class RopeStateSolverNode(Node):
 
     def initialize_controller(self):
         def cost(W, reference, x, u, t):
-            state_err = x - self.state_goal
-            control_err = u - self.control0
+            state_err = x - reference[:x.shape[-1]]
+            control_err = u - reference[x.shape[-1]:]
 
-            return (
-                1.0 * jnp.sum(state_err[:-6] ** 2)
-                + 0.1 * jnp.sum(control_err[:-2] ** 2)
-            )
+            # state weighting
+            q = jnp.ones_like(state_err[:-6])
+
+            # rope node coordinates are interleaved [x, y, z]
+            q = q.at[0::3].set(1.0)   # x weight
+            q = q.at[1::3].set(1.0)    # y weight
+            q = q.at[2::3].set(1.0)    # z weight
+
+            state_cost = jnp.sum(q * (state_err[:-6] ** 2))
+
+            control_cost = 0.1 * jnp.sum(control_err[:-2] ** 2)
+
+            return state_cost + control_cost
 
         def dynamics(x, u, t, parameter):
             return self.env.step(x, u)
@@ -412,80 +850,254 @@ class RopeStateSolverNode(Node):
         seg_idx = int(np.argmin(dists))
         return float(dists[seg_idx]), seg_idx, float(t[seg_idx]), closest[seg_idx]
 
-    def grasp(self):
-        grip_positions = self.get_latest_grip_positions()
+    def visualize_rollouts(
+        self,
+        X_rollout,
+        raw_points=None,
+        stride=5,
+    ):
+        """
+        Debug visualization of predicted MPC rollout states.
+        """
 
-        if grip_positions is None:
-            self.get_logger().warn("Cannot grasp: missing left/right workstation EE poses.")
+        # clear previous debug rollout objects
+        self.server.scene.reset()
+
+        rs = np.linspace(0.0, self.cone_obstacle_radius, 30)
+        thetas = np.linspace(0.0, 2.0 * np.pi, 80)
+
+        obstacle_pts = []
+
+        for r in rs:
+            z = self.cone_obstacle_z_base + self.cone_obstacle_height * (
+                1.0 - r / max(self.cone_obstacle_radius, 1e-8)
+            )
+
+            for theta in thetas:
+                x = self.cone_obstacle_x_center + r * np.cos(theta)
+                y = self.cone_obstacle_y_center + r * np.sin(theta)
+                obstacle_pts.append([x, y, z])
+
+        obstacle_pts = np.asarray(obstacle_pts, dtype=np.float32)
+
+        self.server.scene.add_point_cloud(
+            name="/cone_obstacle",
+            points=obstacle_pts,
+            colors=np.tile(
+                np.array([[255, 80, 80]], dtype=np.uint8),
+                (obstacle_pts.shape[0], 1),
+            ),
+            point_size=0.01,
+        )
+
+        # keep ground
+        _ = self.server.scene.add_grid(name="ground")
+
+        # render current state normally
+        self.env.visualize(self.server, self.state)
+
+        # raw observed rope
+        if raw_points is not None:
+            raw_points_np = np.asarray(raw_points, dtype=np.float32)
+            self.server.scene.add_point_cloud(
+                name="/debug/raw_rope_points",
+                points=raw_points_np,
+                colors=np.tile(
+                    np.array([[255, 255, 255]], dtype=np.uint8),
+                    (raw_points_np.shape[0], 1),
+                ),
+                point_size=0.008,
+            )
+
+        X_rollout_np = np.asarray(X_rollout)
+
+        for k in range(0, X_rollout_np.shape[0], stride):
+            xk = jnp.asarray(X_rollout_np[k])
+
+            x_node, x_weld, x_grip = self.env.unpack_state(xk)
+
+            rope_pts = np.asarray(x_node)
+
+            # rollout rope polyline
+            self.server.scene.add_line_segments(
+                name=f"/debug/rollout_rope_{k}",
+                points=np.stack(
+                    [rope_pts[:-1], rope_pts[1:]],
+                    axis=1,
+                ),
+                colors=np.tile(
+                    np.array([[0, 255, 0]], dtype=np.uint8),
+                    (rope_pts.shape[0] - 1, 2, 1),
+                ),
+                line_width=2.0,
+            )
+
+            # rollout rope nodes
+            self.server.scene.add_point_cloud(
+                name=f"/debug/rollout_nodes_{k}",
+                points=rope_pts,
+                colors=np.tile(
+                    np.array([[0, 255, 0]], dtype=np.uint8),
+                    (rope_pts.shape[0], 1),
+                ),
+                point_size=0.01,
+            )
+
+            # rollout grippers
+            x_grip_np = np.asarray(x_grip)
+
+            self.server.scene.add_point_cloud(
+                name=f"/debug/rollout_grips_{k}",
+                points=x_grip_np,
+                colors=np.tile(
+                    np.array([[255, 0, 0]], dtype=np.uint8),
+                    (x_grip_np.shape[0], 1),
+                ),
+                point_size=0.03,
+            )
+
+    def grasp_one_side(self, side):
+        if side == "left":
+            ee_base_frame = self.ee_base_frame_left
+            latest_ee_pos = self.latest_ee_pos_left
+            goal_pub = self.goal_pose_pub_left
+            grip_pub = self.grip_pub_left
+            starting_attr = "grasping_starting_position_left"
+            closed_attr = "left_gripper_closed"
+        else:
+            ee_base_frame = self.ee_base_frame_right
+            latest_ee_pos = self.latest_ee_pos_right
+            goal_pub = self.goal_pose_pub_right
+            grip_pub = self.grip_pub_right
+            starting_attr = "grasping_starting_position_right"
+            closed_attr = "right_gripper_closed"
+
+        if latest_ee_pos is None or ee_base_frame is None:
+            self.get_logger().warn(f"Cannot grasp {side}: missing EE pose.")
             return
 
-        if self.ee_base_frame_left is None or self.ee_base_frame_right is None:
-            self.get_logger().warn("Cannot grasp: missing left/right base-frame EE poses.")
+        if getattr(self, closed_attr):
             return
 
-        left_ee_pos = grip_positions[0]
-        right_ee_pos = grip_positions[1]
+        if getattr(self, starting_attr) is None:
+            setattr(self, starting_attr, ee_base_frame)
 
-        if self.grasing_starting_position is None:
-            self.grasing_starting_position = {
-                "left": self.ee_base_frame_left,
-                "right": self.ee_base_frame_right,
-            }
-
-        left_at_ground = left_ee_pos[2] <= 0.005
-        right_at_ground = right_ee_pos[2] <= 0.005
-
-        if left_at_ground and right_at_ground and not self.gripper_closed:
-            self.grip_pub_left.publish(Bool(data=True))
-            self.grip_pub_right.publish(Bool(data=True))
-
-            self.gripper_closed = True
-            self.get_logger().info("Closing both grippers")
-            time.sleep(3)
-            self.get_logger().info("Finished closing both grippers")
+        if latest_ee_pos[2] <= self.grip_ground_z:
+            grip_pub.publish(Bool(data=True))
+            setattr(self, closed_attr, True)
+            self.get_logger().info(f"Closing {side} gripper")
             return
 
-        if not self.gripper_closed:
-            left_goal_pose = PoseStamped()
-            left_goal_pose.header.stamp = self.get_clock().now().to_msg()
-            left_goal_pose.header.frame_id = "world"
-            left_goal_pose.pose.position.x = float(
-                self.grasing_starting_position["left"].pose.position.x
-            )
-            left_goal_pose.pose.position.y = float(
-                self.grasing_starting_position["left"].pose.position.y
-            )
-            left_goal_pose.pose.position.z = float(
-                self.ee_base_frame_left.pose.position.z - 0.15 * self.dt
-            )
-            left_goal_pose.pose.orientation.w = 1.0
+        start_pose = getattr(self, starting_attr)
 
-            right_goal_pose = PoseStamped()
-            right_goal_pose.header.stamp = self.get_clock().now().to_msg()
-            right_goal_pose.header.frame_id = "world"
-            right_goal_pose.pose.position.x = float(
-                self.grasing_starting_position["right"].pose.position.x
-            )
-            right_goal_pose.pose.position.y = float(
-                self.grasing_starting_position["right"].pose.position.y
-            )
-            right_goal_pose.pose.position.z = float(
-                self.ee_base_frame_right.pose.position.z - 0.15 * self.dt
-            )
-            right_goal_pose.pose.orientation.w = 1.0
+        goal_pose = PoseStamped()
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.header.frame_id = "world"
 
-            self.goal_pose_pub_left.publish(left_goal_pose)
-            self.goal_pose_pub_right.publish(right_goal_pose)
-        
+        goal_pose.pose.position.x = float(start_pose.pose.position.x)
+        goal_pose.pose.position.y = float(start_pose.pose.position.y)
+        goal_pose.pose.position.z = float(
+            ee_base_frame.pose.position.z - self.grip_down_speed * self.dt
+        )
+        goal_pose.pose.orientation.w = 1.0
 
+        goal_pub.publish(goal_pose)
+            
     def rope_state_callback(self, msg):
-        if self.gripper_closed:
-            self.get_logger().info("Gripped closed, done")
-            return
+        # ==========================================================
+        # After both grippers close, lift upward by 5 cm
+        # ==========================================================
+        if (
+            self.left_gripper_closed
+            and self.right_gripper_closed
+            and not self.in_contact
+        ):
+            # initialize lift phase
+            if not self.post_grasp_lift_active:
+                time.sleep(3)
+                self.post_grasp_lift_active = True
 
-        if self.grasping_procedure and not self.gripper_closed:
-            self.get_logger().info("Starting gripping procedure")
-            self.grasp()
+                self.left_lift_start_z = (
+                    self.ee_base_frame_left.pose.position.z
+                )
+
+                self.right_lift_start_z = (
+                    self.ee_base_frame_right.pose.position.z
+                )
+
+                self.get_logger().info(
+                    "Both grippers closed. Starting post-grasp lift."
+                )
+
+            left_current_z = self.ee_base_frame_left.pose.position.z
+            right_current_z = self.ee_base_frame_right.pose.position.z
+
+            left_done = (
+                left_current_z
+                >= self.left_lift_start_z + self.post_grasp_lift_height
+            )
+
+            right_done = (
+                right_current_z
+                >= self.right_lift_start_z + self.post_grasp_lift_height
+            )
+
+            # publish left upward motion
+            if not left_done:
+                left_goal_pose = PoseStamped()
+                left_goal_pose.header.stamp = self.get_clock().now().to_msg()
+                left_goal_pose.header.frame_id = "world"
+
+                left_goal_pose.pose.position.x = float(
+                    self.ee_base_frame_left.pose.position.x
+                )
+
+                left_goal_pose.pose.position.y = float(
+                    self.ee_base_frame_left.pose.position.y
+                )
+
+                left_goal_pose.pose.position.z = float(
+                    self.ee_base_frame_left.pose.position.z
+                    + self.post_grasp_lift_speed * self.dt
+                )
+                self.get_logger().info("Publishing up left")
+                left_goal_pose.pose.orientation.w = 1.0
+
+                self.goal_pose_pub_left.publish(left_goal_pose)
+
+            # publish right upward motion
+            if not right_done:
+                right_goal_pose = PoseStamped()
+                right_goal_pose.header.stamp = self.get_clock().now().to_msg()
+                right_goal_pose.header.frame_id = "world"
+
+                right_goal_pose.pose.position.x = float(
+                    self.ee_base_frame_right.pose.position.x
+                )
+
+                right_goal_pose.pose.position.y = float(
+                    self.ee_base_frame_right.pose.position.y
+                )
+
+                right_goal_pose.pose.position.z = float(
+                    self.ee_base_frame_right.pose.position.z
+                    + self.post_grasp_lift_speed * self.dt
+                )
+
+                right_goal_pose.pose.orientation.w = 1.0
+                self.get_logger().info("Publishing up right")
+                self.goal_pose_pub_right.publish(right_goal_pose)
+
+            # once both lifted enough, transition into contact mode
+            if left_done and right_done:
+                self.get_logger().info(
+                    "Post-grasp lift complete. Enabling contact mode."
+                )
+
+                self.in_contact = True
+                self.first_solve = True
+                self.post_grasp_lift_active = False
+            time.sleep(0.01)
             return
 
         if self.num_iterations >= 300:
@@ -519,31 +1131,67 @@ class RopeStateSolverNode(Node):
             ],
             dtype=np.float32,
         )
+        if raw_points.shape[0] == 0:
+            self.get_logger().warn("Missing points")
+            return
 
-        sampled = resample_fixed_link_length_extend(
-            raw_points,
-            self.env.params.num_nodes,
-            link_length=self.env.params.segment_length,
-        )
+
+        if not self.in_contact:
+            sampled = resample_fixed_link_length_extend(
+                raw_points,
+                self.env.params.num_nodes,
+                link_length=self.env.params.segment_length,
+            )
+
+        if self.in_contact:
+            sampled = resample_fixed_link_length_extend_lr(
+                raw_points,
+                self.env.params.num_nodes,
+                link_length=0.1,
+                grip_positions=grip_positions,
+            )
+            grip_positions = project_grippers_to_nearest_rope_points(
+                sampled_points=sampled,
+                grip_positions=grip_positions,
+            )
+
+        if self.grasp_reference_sampled is None:
+            self.grasp_reference_sampled = sampled
+
+        if self.grasp_reference_sampled is None:
+            self.get_logger().warn("grasp referenced sampled is None")
+            return
 
         closest_dist_left, closest_seg_idx, closest_t, closest_point = (
-            self.closest_point_on_rope_segments(sampled, grip_positions[0])
+            self.closest_point_on_rope_segments(self.grasp_reference_sampled, grip_positions[0])
         )
 
         closest_dist_right, closest_seg_idx, closest_t, closest_point = (
-            self.closest_point_on_rope_segments(sampled, grip_positions[1])
+            self.closest_point_on_rope_segments(self.grasp_reference_sampled, grip_positions[1])
         )
+        if not self.in_contact:
+            self.get_logger().info(
+                f"Closest LEFT rope point: dist={closest_dist_left:.4f} m, grip={grip_positions[0]}"
+            )
+            self.get_logger().info(
+                f"Closest RIGHT rope point: dist={closest_dist_right:.4f} m, grip={grip_positions[1]}"
+            )
 
-        self.get_logger().info(
-            f"Closest LEFT rope point: dist={closest_dist_left:.4f} m, grip={grip_positions[0]}"
-        )
-        self.get_logger().info(
-            f"Closest RIGHT rope point: dist={closest_dist_right:.4f} m, grip={grip_positions[1]}"
-        )
+        if (
+            closest_dist_left <= self.grip_activation_dist
+            and not self.left_grasping_procedure
+            and not self.left_gripper_closed
+        ):
+            self.left_grasping_procedure = True
+            self.get_logger().info("LEFT entered gripping range; switching LEFT to grasp subroutine.")
 
-        if closest_dist_left <= 0.031 and closest_dist_right <= 0.031:
-            self.grasping_procedure = True
-            return
+        if (
+            closest_dist_right <= self.grip_activation_dist
+            and not self.right_grasping_procedure
+            and not self.right_gripper_closed
+        ):
+            self.right_grasping_procedure = True
+            self.get_logger().info("RIGHT entered gripping range; switching RIGHT to grasp subroutine.")
 
         if sampled is None:
             self.get_logger().warn("Could not resample rope_state.")
@@ -563,7 +1211,15 @@ class RopeStateSolverNode(Node):
             self.get_logger().info(
                 "Initialized state from first rope state and real gripper pose."
             )
-        else:
+
+        if self.state_goals[0] is None:
+            nodes_goal = jnp.asarray(sampled)
+            nodes_goal = nodes_goal.at[:, 2].set(0.05)
+
+            self.state_goals[0] = self.env.state(x_node=nodes_goal)
+            self.get_logger().info("Initialized subgoal #1 from current rope state.")
+
+        if not self.in_contact:
             x_node, x_weld, x_grip = self.env.unpack_state(self.state)
 
             grip_positions_jnp = jnp.asarray(grip_positions)
@@ -576,43 +1232,60 @@ class RopeStateSolverNode(Node):
                 ]
             )
 
+        if self.in_contact:
+            # sampled = teleport_rope_closest_points_rigid(
+            #     sampled_points=sampled,
+            #     grip_positions=grip_positions,
+            # )
+            sampled = teleport_rope_closest_points_shear(
+                            sampled_points=sampled,
+                            grip_positions=grip_positions,
+                        )
+
+            sampled = resample_fixed_spacing(
+                sampled,
+                num_points=self.env.params.num_nodes,
+                spacing=self.env.params.segment_length,
+            )
+            
+            alpha = 0.7
+            if self.prev_sampled is not None:
+                sampled = alpha * self.prev_sampled + (1.0 - alpha) * sampled
+            self.prev_sampled = sampled.copy()
+
+            sampled_jnp = jnp.asarray(sampled)
+            
+            x_node, x_weld, x_grip = self.env.unpack_state(self.state)
+
+            grip_positions_jnp = jnp.asarray(grip_positions)
+
+            self.state = state_from_rope_points(
+                self.env,
+                self.state,
+                sampled_jnp,
+                grip_positions=grip_positions,
+            )
+
         if self.controller is None:
             self.initialize_controller()
+        if not self.visualize_rollouts_enabled:
+            self.env.visualize(self.server, self.state)
 
-        self.env.visualize(self.server, self.state)
-
-        if self.first_solve:
+        if self.first_solve and not self.in_contact:
             X_in = jnp.tile(self.state[None, :], (self.N + 1, 1))
             U_in = jnp.tile(self.control0[None, :], (self.N, 1))
             U_in = U_in.at[:, 2].set(-0.2)
             U_in = U_in.at[:, 5].set(-0.2)
 
-            # GROUND_Z = 0.0
-
-            # for i in range(U_in.shape[0]):
-            #     x_curr = X_in[i]
-
-            #     # unpack current grip position
-            #     _, _, x_grip = self.env.unpack_state(x_curr)
-
-            #     grip_z = x_grip[0, 2]
-
-            #     u = U_in[i]
-
-            #     # prevent commanding downward motion once at/below ground
-            #     u = jax.lax.cond(
-            #         grip_z <= GROUND_Z,
-            #         lambda uu: uu.at[2].set(jnp.maximum(uu[2], 0.0)),
-            #         lambda uu: uu,
-            #         u,
-            #     )
-
-            #     X_in = X_in.at[i + 1].set(self.env.step(x_curr, u))
-            #     U_in = U_in.at[i].set(u)
-
             self.controller.X0 = X_in
             self.controller.U0 = U_in
-
+            self.reference = jnp.concatenate([self.state_goals[0], self.control0], axis=0)
+            self.first_solve = False
+        
+        if self.first_solve and self.in_contact:
+            self.controller.X0 = jnp.tile(self.state[None, :], (self.N + 1, 1))
+            self.controller.U0 = jnp.tile(self.control0[None, :], (self.N, 1))
+            self.reference = jnp.concatenate([self.state_goals[1], self.control0], axis=0)
             self.first_solve = False
 
         if (
@@ -650,15 +1323,93 @@ class RopeStateSolverNode(Node):
         solve_start = time.time()
         out = self.controller.run(
             x0=self.state,
-            reference=None,
+            reference=self.reference,
             parameter=None,
             Xi=jnp.zeros((self.state.shape[0], self.state.shape[0])),
         )
 
         solve_time = time.time() - solve_start
-        U = out[2]
-        # u0 = out[0]
-        U.block_until_ready()
+
+        X_sol = out[1]
+        U_sol = out[2]
+
+        U_sol.block_until_ready()
+
+        solve_converged = (out[-1] < 399)
+
+        if solve_converged:
+            U = U_sol
+            X = X_sol
+            U_shift = jnp.concatenate(
+                [
+                    U_sol[1:],
+                    U_sol[-1:],
+                ],
+                axis=0,
+            )
+
+            # Shift states forward.
+            X_shift = jnp.concatenate(
+                [
+                    X_sol[1:],
+                    X_sol[-1:],
+                ],
+                axis=0,
+            )
+            self.prev_U_solved = U_sol
+            self.prev_X_solved = X_sol
+        else:
+            if self.prev_U_solved is None:
+                self.get_logger().warn("No previous solved trajectory.")
+                return
+
+            # Use stored fallback.
+            U = self.prev_U_solved
+            X = self.prev_X_solved
+
+            # Shift forward for next iteration.
+            U_shift = jnp.concatenate(
+                [
+                    U[1:],
+                    U[-1:],
+                ],
+                axis=0,
+            )
+
+            X_shift = jnp.concatenate(
+                [
+                    X[1:],
+                    X[-1:],
+                ],
+                axis=0,
+            )
+
+            # Re-anchor initial state.
+            X_shift = X_shift.at[0].set(self.state)
+
+            self.prev_U_solved = U_shift
+            self.prev_X_solved = X_shift
+
+            # Also use shifted version as warm start.
+            self.controller.U0 = jnp.tile(self.control0[None, :], (self.N, 1))
+            self.controller.X0 = jnp.tile(self.state[None, :], (self.N + 1, 1))
+
+        # Force first state to match current measured state.
+        X_shift = X_shift.at[0].set(self.state)
+
+        self.prev_U_solved = U_shift
+        self.prev_X_solved = X_shift
+        # ==========================================================
+        # Debug rollout visualization
+        # ==========================================================
+        if self.visualize_rollouts_enabled:
+            X_rollout = jnp.stack(X)
+
+            self.visualize_rollouts(
+                X_rollout,
+                raw_points=raw_points,
+                stride=5,
+            )
 
         u0_np = np.asarray(U[0])
         u1_np = np.asarray(U[1])
@@ -671,46 +1422,49 @@ class RopeStateSolverNode(Node):
         u1_np = np.clip(u1_np, -np.asarray(self.u_max), np.asarray(self.u_max))
         # control = u0_np * 1.0
         # control = u0_np + u1_np
-        control = u0_np * 2.0
+        control = u0_np
+        if not self.in_contact:
+            control = u0_np * 2.0
 
         left_control = control[0:3]
         right_control = control[3:6]
-        # if np.linalg.norm(u0_np[:3]) <= 0.5:
-        #     control += u1_np
-        # control = np.clip(control, -np.asarray(self.u_max), np.asarray(self.u_max))
+        if self.left_grasping_procedure and not self.in_contact:
+            self.grasp_one_side("left")
+        else:
+            left_goal_pose = PoseStamped()
+            left_goal_pose.header.stamp = self.get_clock().now().to_msg()
+            left_goal_pose.header.frame_id = "world"
+            left_goal_pose.pose.position.x = float(
+                self.ee_base_frame_left.pose.position.x + left_control[0] * self.dt
+            )
+            left_goal_pose.pose.position.y = float(
+                self.ee_base_frame_left.pose.position.y + left_control[1] * self.dt
+            )
+            left_goal_pose.pose.position.z = float(
+                self.ee_base_frame_left.pose.position.z + left_control[2] * self.dt
+            )
+            left_goal_pose.pose.orientation.w = 1.0
+            self.goal_pose_pub_left.publish(left_goal_pose)
+
+        if self.right_grasping_procedure and not self.in_contact:
+            self.grasp_one_side("right")
+        else:
+            right_goal_pose = PoseStamped()
+            right_goal_pose.header.stamp = self.get_clock().now().to_msg()
+            right_goal_pose.header.frame_id = "world"
+            right_goal_pose.pose.position.x = float(
+                self.ee_base_frame_right.pose.position.x + right_control[0] * self.dt
+            )
+            right_goal_pose.pose.position.y = float(
+                self.ee_base_frame_right.pose.position.y + right_control[1] * self.dt
+            )
+            right_goal_pose.pose.position.z = float(
+                self.ee_base_frame_right.pose.position.z + right_control[2] * self.dt
+            )
+            right_goal_pose.pose.orientation.w = 1.0
+            self.goal_pose_pub_right.publish(right_goal_pose)
+
         callback_time = time.time() - callback_start
-
-
-        left_goal_pose = PoseStamped()
-        left_goal_pose.header.stamp = self.get_clock().now().to_msg()
-        left_goal_pose.header.frame_id = "world"
-        left_goal_pose.pose.position.x = float(
-            self.ee_base_frame_left.pose.position.x + left_control[0] * self.dt
-        )
-        left_goal_pose.pose.position.y = float(
-            self.ee_base_frame_left.pose.position.y + left_control[1] * self.dt
-        )
-        left_goal_pose.pose.position.z = float(
-            self.ee_base_frame_left.pose.position.z + left_control[2] * self.dt
-        )
-        left_goal_pose.pose.orientation.w = 1.0
-
-        right_goal_pose = PoseStamped()
-        right_goal_pose.header.stamp = self.get_clock().now().to_msg()
-        right_goal_pose.header.frame_id = "world"
-        right_goal_pose.pose.position.x = float(
-            self.ee_base_frame_right.pose.position.x + right_control[0] * self.dt
-        )
-        right_goal_pose.pose.position.y = float(
-            self.ee_base_frame_right.pose.position.y + right_control[1] * self.dt
-        )
-        right_goal_pose.pose.position.z = float(
-            self.ee_base_frame_right.pose.position.z + right_control[2] * self.dt
-        )
-        right_goal_pose.pose.orientation.w = 1.0
-
-        self.goal_pose_pub_left.publish(left_goal_pose)
-        self.goal_pose_pub_right.publish(right_goal_pose)
 
         self.get_logger().info("=" * 80)
 
@@ -749,13 +1503,13 @@ class RopeStateSolverNode(Node):
         )
 
         self.get_logger().info(f"u0_left: {u0_np[0:3]}")
-        self.get_logger().info(f"u0_right:  {u0_np[4:6]}")
+        self.get_logger().info(f"u0_right:  {u0_np[3:6]}")
 
         self.get_logger().info(f"control_left:  {left_control}")
         self.get_logger().info(f"control_right: {right_control}")
 
         self.get_logger().info("=" * 80)
-        # time.sleep(0.01)
+        # time.sleep(1.0)
 
 
 def main(args=None):
