@@ -57,22 +57,62 @@ def generate_launch_description():
         ]
     )
 
-    fit_spline = Node(
+    tapnn_back = Node(
         package="perception",
-        executable="fit_spline",
+        executable="tapnn_back",
         output="screen",
         parameters=[
             {
-                "body_translation_x": 0.88,
+                "tapnn_checkpoint_path": tapnn_checkpoint
+            }
+        ]
+    )
+
+    front_fit_spline = Node(
+        package="perception",
+        executable="front_fit_spline",
+        output="screen",
+        parameters=[
+            {
+                "body_translation_x": 0.85,
                 "body_translation_y": 0.0,
                 "body_translation_z": 0.29,
             }
         ],
     )
 
+    back_fit_spline = Node(
+        package="perception",
+        executable="back_fit_spline",
+        output="screen",
+        parameters=[
+            {
+                "body_translation_x": -0.9,
+                "body_translation_y": 0.0,
+                "body_translation_z": 0.29,
+            }
+        ],
+    )
+
+    rope_point_joint = Node(
+        package="perception",
+        executable="rope_points_joint",
+        output="screen",
+    )
+
+    perception_switch_monitor = Node(
+        package='perception',
+        executable="perception_switch_monitor",
+        output="screen"
+    )
+
     return LaunchDescription([
         front_node,
         back_node,
         tapnn_front,
-        fit_spline
+        front_fit_spline,
+        tapnn_back,
+        back_fit_spline,
+        rope_point_joint,
+        perception_switch_monitor
     ])

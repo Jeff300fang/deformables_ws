@@ -8,7 +8,9 @@ import copy
 
 import rclpy
 from rclpy.node import Node
+
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Bool
 
 
 class IiwaPoseTeleopNode(Node):
@@ -22,42 +24,56 @@ class IiwaPoseTeleopNode(Node):
             10,
         )
 
-        self.pub = self.create_publisher(
+        self.pose_pub = self.create_publisher(
             PoseStamped,
             "/left/iiwa/goal_pose",
+            10,
+        )
+
+        self.grip_pub = self.create_publisher(
+            Bool,
+            "/left_grip",
             10,
         )
 
         self.current_pose = None
         self.goal_pose = None
 
-        self.step = 0.005  # 2 mm
+        self.step = 0.005  # meters
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-        self.get_logger().info("Waiting for /end_effector_pose ...")
+        self.get_logger().info("Waiting for /left/end_effector_pose ...")
         self.print_help()
 
     def print_help(self):
-        print("""
+        print(
+            """
 Keyboard teleop:
   w/s : +x / -x
   a/d : +y / -y
   q/e : +z / -z
 
-  +/- : increase/decrease step
+  g : grip
+  u : ungrip
+
   space : publish current goal again
+
   ESC or Ctrl-C : quit
 
 Current step: %.4f m
-""" % self.step)
+"""
+            % self.step
+        )
 
     def pose_callback(self, msg: PoseStamped):
         self.current_pose = msg
 
         if self.goal_pose is None:
             self.goal_pose = copy.deepcopy(msg)
-            self.get_logger().info("Initialized goal pose from current pose.")
+            self.get_logger().info(
+                "Initialized goal pose from current pose."
+            )
 
     def get_key(self):
         if select.select([sys.stdin], [], [], 0.0)[0]:
@@ -77,22 +93,41 @@ Current step: %.4f m
             rclpy.shutdown()
             return
 
-        moved = True
+        moved = False
 
         if key == "w":
             self.goal_pose.pose.position.x += self.step
+            moved = True
+
         elif key == "s":
             self.goal_pose.pose.position.x -= self.step
+            moved = True
+
         elif key == "a":
             self.goal_pose.pose.position.y += self.step
+            moved = True
+
         elif key == "d":
             self.goal_pose.pose.position.y -= self.step
+            moved = True
+
         elif key == "q":
             self.goal_pose.pose.position.z += self.step
+            moved = True
+
         elif key == "e":
             self.goal_pose.pose.position.z -= self.step
+            moved = True
+
         elif key == " ":
             moved = True
+
+        elif key == "g":
+            self.publish_grip(True)
+
+        elif key == "u":
+            self.publish_grip(False)
+
         else:
             return
 
@@ -106,12 +141,27 @@ Current step: %.4f m
         if goal.header.frame_id == "":
             goal.header.frame_id = "world"
 
-        self.pub.publish(goal)
+        self.pose_pub.publish(goal)
 
         p = goal.pose.position
+
         self.get_logger().info(
-            f"Published goal: x={p.x:.4f}, y={p.y:.4f}, z={p.z:.4f}"
+            f"Published goal: "
+            f"x={p.x:.4f}, "
+            f"y={p.y:.4f}, "
+            f"z={p.z:.4f}"
         )
+
+    def publish_grip(self, grip: bool):
+        msg = Bool()
+        msg.data = grip
+
+        self.grip_pub.publish(msg)
+
+        if grip:
+            self.get_logger().info("Published GRIP command.")
+        else:
+            self.get_logger().info("Published UNGRIP command.")
 
 
 def main(args=None):
@@ -124,10 +174,17 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
+
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        termios.tcsetattr(
+            sys.stdin,
+            termios.TCSADRAIN,
+            old_settings,
+        )
+
         if rclpy.ok():
             node.destroy_node()
             rclpy.shutdown()

@@ -10,7 +10,8 @@ from bkstools.bks_lib.bks_base import keep_communication_alive_sleep
 
 HOST = "192.170.10.5"
 
-GRIP_POS_UM = 28000
+# GRIP_POS_UM = 40000
+GRIP_POS_UM = 26000
 OPEN_POS_UM = 80000
 
 MOVE_VEL_UMS = 25000

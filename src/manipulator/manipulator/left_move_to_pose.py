@@ -106,9 +106,9 @@ class IiwaMpcGoalPoseNode(Node):
             return
         p_now = self.ik.fk_position(q_now)
         cartesian_step = float(np.linalg.norm(p_goal - p_now))
-        if p_goal[2] < 0.2:
+        if p_goal[2] < 0.195:
             self.get_logger().warn(
-                f"Rejected goal pose: z={p_goal[2]:.3f} m is below limit 0.200 m"
+                f"Rejected goal pose: z={p_goal[2]:.3f} m is below limit 0.195 m"
             )
             return
         if cartesian_step > self.max_cartesian_step_m + 0.001:

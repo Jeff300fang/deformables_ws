@@ -37,7 +37,11 @@ setup(
             'sam_detection_front = perception.sam_detection_front:main',
             'sam_detection_back = perception.sam_detection_back:main',
             'tapnn_front = perception.tap_next_next_front:main',
-            'fit_spline = perception.fit_spline:main'
+            'tapnn_back = perception.tap_next_next_back:main',
+            'front_fit_spline = perception.front_fit_spline:main',
+            'back_fit_spline = perception.back_fit_spline:main',
+            'rope_points_joint = perception.rope_points_joint:main',
+            'perception_switch_monitor = perception.perception_switch_monitor:main'
         ],
     },
 )

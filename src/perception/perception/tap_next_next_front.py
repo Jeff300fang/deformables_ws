@@ -14,6 +14,7 @@ from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import PoseArray
 from std_msgs.msg import Float32MultiArray
 from cv_bridge import CvBridge
+from std_msgs.msg import Bool
 
 
 for workspace_root in [Path.cwd(), *Path(__file__).resolve().parents]:
@@ -30,7 +31,7 @@ CKPT_SIZE = (256, 256)
 
 class TAPNextFromSAMNode(Node):
     def __init__(self):
-        super().__init__("tapnext_from_sam_node")
+        super().__init__("front_tapnext_from_sam_node")
 
         self.declare_parameter("image_topic", "/front_camera/color/image_raw")
         self.declare_parameter("sam_keypoints_topic", "/front_camera/sam_rope/keypoints")
@@ -94,33 +95,45 @@ class TAPNextFromSAMNode(Node):
             Image,
             self.image_topic,
             self.image_callback,
-            10,
+            1,
         )
 
         self.keypoints_sub = self.create_subscription(
             PoseArray,
             self.sam_keypoints_topic,
             self.keypoints_callback,
-            10,
+            1,
         )
 
         self.keypoints_pub = self.create_publisher(
             Float32MultiArray,
             self.tracked_keypoints_topic,
-            10,
+            1,
         )
 
         self.annotated_pub = self.create_publisher(
             CompressedImage,
             self.annotated_topic,
-            10,
+            1,
         )
+
+        self.stop_front_sub = self.create_subscription(
+            Bool,
+            '/stop_front',
+            self.stop_callback,
+            1
+        )
+
+        self.stop = False
 
         self.get_logger().info(f"Subscribed image: {self.image_topic}")
         self.get_logger().info(f"Subscribed SAM keypoints: {self.sam_keypoints_topic}")
         self.get_logger().info(
             f"Publishing TAPNext keypoints: {self.tracked_keypoints_topic}"
         )
+
+    def stop_callback(self, msg):
+        self.stop = msg.data
 
     def stamp_to_ns(self, stamp):
         return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
@@ -382,6 +395,10 @@ class TAPNextFromSAMNode(Node):
         self.annotated_pub.publish(msg)
 
     def image_callback(self, msg):
+        if self.stop:
+            self.get_logger().info("Skipping because we stopped")
+            return
+
         try:
             frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             frame_rgb = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)

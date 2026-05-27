@@ -16,6 +16,7 @@ from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import PoseArray, Pose
 from cv_bridge import CvBridge
 from skimage.morphology import skeletonize
+from std_msgs.msg import Bool
 
 
 for workspace_root in [Path.cwd(), *Path(__file__).resolve().parents]:
@@ -30,7 +31,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 
 class SingleCameraSAMRopeNode(Node):
     def __init__(self):
-        super().__init__("single_camera_sam_rope_node")
+        super().__init__("front_single_camera_sam_rope_node")
 
         self.declare_parameter(
             "sam_checkpoint_path",
@@ -95,32 +96,42 @@ class SingleCameraSAMRopeNode(Node):
             Image,
             "/front_camera/color/image_raw",
             self.image_callback,
-            10,
+            1,
         )
 
         self.mask_pub = self.create_publisher(
             Image,
             "/front_camera/sam_rope/mask",
-            10,
+            1,
         )
 
         self.skeleton_pub = self.create_publisher(
             Image,
             "/front_camera/sam_rope/skeleton",
-            10,
+            1,
         )
 
         self.keypoints_pub = self.create_publisher(
             PoseArray,
             "/front_camera/sam_rope/keypoints",
-            10,
+            1,
         )
 
         self.annotated_pub = self.create_publisher(
             CompressedImage,
             "/front_camera/sam_rope/annotated_image/compressed",
-            10,
+            1,
         )
+        self.stop_front_sub = self.create_subscription(
+            Bool,
+            '/stop_front',
+            self.stop_callback,
+            1
+        )
+        self.stop = False
+
+    def stop_callback(self, msg):
+        self.stop = msg.data
 
     def maybe_resize(self, rgb):
         if self.resize_width <= 0:
@@ -393,6 +404,9 @@ class SingleCameraSAMRopeNode(Node):
         self.annotated_pub.publish(msg)
 
     def image_callback(self, msg):
+        if self.stop:
+            return
+
         try:
             now = self.get_clock().now()
 
