@@ -5,3 +5,4 @@ log/
 obstacle/
 .vscode
 __pycache__/
+*.npz

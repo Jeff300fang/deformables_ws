@@ -166,7 +166,7 @@ class RopePoseSimRenderer(Node):
 
         with self.lock:
             self.latest_points = points
-
+        self.get_logger().info(f"{points}")
         self.get_logger().info(f"Received {len(points)} rope poses")
 
 

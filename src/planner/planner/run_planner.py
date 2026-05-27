@@ -377,6 +377,32 @@ def project_grippers_to_nearest_rope_points(sampled_points, grip_positions):
 
     return np.asarray(new_grips, dtype=np.float32)
 
+def project_rope_to_gripper_vertical_plane(sampled_points, grip_positions):
+    pts = np.asarray(sampled_points, dtype=np.float32).copy()
+    grips = np.asarray(grip_positions, dtype=np.float32)
+
+    g0 = grips[0]
+    g1 = grips[1]
+
+    # horizontal direction between grippers
+    d = g1 - g0
+    d[2] = 0.0
+
+    norm = np.linalg.norm(d)
+    if norm < 1e-8:
+        return pts
+
+    e = d / norm
+
+    # project each point onto line through g0 in xy, keep original z
+    rel = pts - g0[None, :]
+    along = rel[:, 0] * e[0] + rel[:, 1] * e[1]
+
+    pts[:, 0] = g0[0] + along * e[0]
+    pts[:, 1] = g0[1] + along * e[1]
+
+    return pts
+
 def make_control_constraints(u_min, u_max):
     def constraints(x, u, t):
         return jnp.concatenate((u - u_max, u_min - u))
@@ -392,73 +418,253 @@ def make_constant_disturbance(alpha):
 
     return disturbance
 
+# def make_control_and_obstacle_constraints(
+#     env,
+#     u_min: jnp.ndarray,
+#     u_max: jnp.ndarray,
+#     cone_centers_xy: jnp.ndarray,
+#     cone_radius: float,
+#     cone_z_top: float,
+#     num_edge_samples: int = 5,
+# ):
+#     def constraints(x, u, t):
+#         control_constraints = jnp.concatenate((u - u_max, u_min - u))
+
+#         rope_nodes, _, gripper_pos = env.unpack_state(x)
+
+#         left_pos, right_pos = gripper_pos[0], gripper_pos[1]
+#         effector_constraints = jnp.array([-left_pos[1], right_pos[1]])
+
+#         # --------------------------------------------------
+#         # Sample actual rope nodes + points between nodes
+#         # --------------------------------------------------
+#         node_pts = rope_nodes
+
+#         a = rope_nodes[:-1]
+#         b = rope_nodes[1:]
+
+#         alphas = jnp.linspace(
+#             0.0,
+#             1.0,
+#             num_edge_samples + 2,
+#         )[1:-1]
+
+#         edge_pts = (
+#             a[:, None, :] * (1.0 - alphas[None, :, None])
+#             + b[:, None, :] * alphas[None, :, None]
+#         ).reshape(-1, 3)
+
+#         pts = jnp.concatenate([node_pts, edge_pts], axis=0)
+
+#         pt_xy = pts[:, 0:2]
+#         pt_z = pts[:, 2]
+
+#         # --------------------------------------------------
+#         # Cone obstacle constraints on all sampled rope points
+#         # constraint <= 0 is feasible
+#         # --------------------------------------------------
+#         obstacle_constraints = []
+
+#         for cone_center_xy in cone_centers_xy:
+#             radial_dist = jnp.linalg.norm(
+#                 pt_xy - cone_center_xy[None, :],
+#                 axis=1,
+#             )
+
+#             z_required = cone_z_top * jnp.maximum(
+#                 1.0 - radial_dist / cone_radius,
+#                 0.0,
+#             )
+
+#             cone_constraints = z_required - pt_z
+
+#             cone_constraints = jnp.where(
+#                 radial_dist <= cone_radius,
+#                 cone_constraints,
+#                 -1.0,
+#             )
+
+#             obstacle_constraints.append(cone_constraints)
+
+#         obstacle_constraints = jnp.concatenate(obstacle_constraints)
+
+#         return jnp.concatenate(
+#             (
+#                 control_constraints,
+#                 effector_constraints,
+#                 obstacle_constraints,
+#             )
+#         )
+
+#     return constraints
+
+# def make_control_and_obstacle_constraints(
+#     env,
+#     u_min: jnp.ndarray,
+#     u_max: jnp.ndarray,
+#     cone_centers_xy: jnp.ndarray,
+#     cone_radius: float,
+#     cone_z_top: float,
+# ):
+#     def constraints(x, u, t):
+#         control_constraints = jnp.concatenate((u - u_max, u_min - u))
+
+#         rope_nodes, _, gripper_pos = env.unpack_state(x)
+#         left_pos, right_pos = gripper_pos[0], gripper_pos[1]
+#         effector_constraints = jnp.array([-left_pos[1], right_pos[1]])
+
+#         node_xy = rope_nodes[:, 0:2]
+#         node_z = rope_nodes[:, 2]
+
+#         obstacle_constraints = []
+#         for cone_center_xy in cone_centers_xy:
+#             radial_dist = jnp.linalg.norm(node_xy - cone_center_xy[None, :], axis=1)
+#             z_required = cone_z_top * jnp.maximum(1.0 - (radial_dist / cone_radius), 0.0)
+
+#             cone_constraints = z_required - node_z
+#             cone_constraints = jnp.where(
+#                 radial_dist <= cone_radius,
+#                 cone_constraints,
+#                 -1.0,
+#             )
+#             obstacle_constraints.append(cone_constraints)
+
+#         obstacle_constraints = jnp.concatenate(obstacle_constraints)
+
+#         return jnp.concatenate((control_constraints, effector_constraints, obstacle_constraints))
+
+#     return constraints
+
+# def make_control_and_obstacle_constraints(
+#     env,
+#     u_min,
+#     u_max,
+#     obstacle_centers,
+#     parabola_radius_x,
+#     parabola_width_y,
+#     parabola_height,
+# ):
+#     def constraints(x, u, t):
+#         control_constraints = jnp.concatenate((u - u_max, u_min - u))
+
+#         rope_nodes, _, gripper_pos = env.unpack_state(x)
+
+#         left_pos, right_pos = gripper_pos[0], gripper_pos[1]
+#         effector_constraints = jnp.array([
+#             -left_pos[1],
+#             right_pos[1],
+#         ])
+
+#         obstacle_constraints = []
+
+#         for center in obstacle_centers:
+#             x_c, y_c = center
+
+#             dx = rope_nodes[:, 0] - x_c
+#             dy = rope_nodes[:, 1] - y_c
+#             z = rope_nodes[:, 2]
+
+#             inside_x = jnp.abs(dx) <= parabola_radius_x
+#             inside_y = jnp.abs(dy) <= (parabola_width_y / 2.0)
+
+#             z_required = parabola_height * (
+#                 1.0 - (dx / parabola_radius_x) ** 2
+#             )
+
+#             constraint = z_required - z
+
+#             active = inside_x & inside_y
+
+#             constraint = jnp.where(active, constraint, -1.0)
+
+#             obstacle_constraints.append(constraint)
+
+#         obstacle_constraints = jnp.concatenate(obstacle_constraints)
+
+#         return jnp.concatenate((
+#             control_constraints,
+#             effector_constraints,
+#             obstacle_constraints,
+#         ))
+
+#     return constraints
+
 def make_control_and_obstacle_constraints(
     env,
     u_min: jnp.ndarray,
     u_max: jnp.ndarray,
-    cone_centers_xy: jnp.ndarray,
-    cone_radius: float,
-    cone_z_top: float,
-    num_edge_samples: int = 5,
+    obstacle_centers_xy: jnp.ndarray,
+    parabola_radius_x: float,
+    parabola_width_y: float,
+    parabola_height: float,
+    z_base: float = 0.0,
+    tau: float = 1e-3,
+    eps: float = 1e-6,
 ):
+    """
+    Constraint convention:
+        constraint <= 0 is feasible.
+
+    Forbidden parabolic slab:
+        |x - x_c| <= parabola_radius_x
+        |y - y_c| <= parabola_width_y / 2
+        z <= z_base + parabola_height * (1 - ((x - x_c) / parabola_radius_x)^2)
+
+    The obstacle constraint is positive only inside this forbidden volume.
+    """
+
+    def smooth_abs(a):
+        return jnp.sqrt(a * a + eps * eps)
+
+    def smooth_min(a, b):
+        # smooth approximation of min(a, b)
+        return -tau * jax.nn.logsumexp(
+            jnp.stack((-a / tau, -b / tau), axis=0),
+            axis=0,
+        )
+
+    def smooth_min3(a, b, c):
+        return smooth_min(smooth_min(a, b), c)
+
     def constraints(x, u, t):
         control_constraints = jnp.concatenate((u - u_max, u_min - u))
 
         rope_nodes, _, gripper_pos = env.unpack_state(x)
 
         left_pos, right_pos = gripper_pos[0], gripper_pos[1]
-        effector_constraints = jnp.array([-left_pos[1], right_pos[1]])
 
-        # --------------------------------------------------
-        # Sample actual rope nodes + points between nodes
-        # --------------------------------------------------
-        node_pts = rope_nodes
+        effector_constraints = jnp.array([
+            -left_pos[1],
+            right_pos[1],
+        ])
 
-        a = rope_nodes[:-1]
-        b = rope_nodes[1:]
+        node_x = rope_nodes[:, 0]
+        node_y = rope_nodes[:, 1]
+        node_z = rope_nodes[:, 2]
 
-        alphas = jnp.linspace(
-            0.0,
-            1.0,
-            num_edge_samples + 2,
-        )[1:-1]
-
-        edge_pts = (
-            a[:, None, :] * (1.0 - alphas[None, :, None])
-            + b[:, None, :] * alphas[None, :, None]
-        ).reshape(-1, 3)
-
-        pts = jnp.concatenate([node_pts, edge_pts], axis=0)
-
-        pt_xy = pts[:, 0:2]
-        pt_z = pts[:, 2]
-
-        # --------------------------------------------------
-        # Cone obstacle constraints on all sampled rope points
-        # constraint <= 0 is feasible
-        # --------------------------------------------------
         obstacle_constraints = []
 
-        for cone_center_xy in cone_centers_xy:
-            radial_dist = jnp.linalg.norm(
-                pt_xy - cone_center_xy[None, :],
-                axis=1,
+        for center_xy in obstacle_centers_xy:
+            x_c = center_xy[0]
+            y_c = center_xy[1]
+
+            dx = node_x - x_c
+            dy = node_y - y_c
+
+            z_surface = z_base + parabola_height * (
+                1.0 - (dx / parabola_radius_x) ** 2
             )
 
-            z_required = cone_z_top * jnp.maximum(
-                1.0 - radial_dist / cone_radius,
-                0.0,
-            )
+            # Positive means inside each corresponding part of the forbidden slab.
+            phi_x = parabola_radius_x - smooth_abs(dx)
+            phi_y = 0.5 * parabola_width_y - smooth_abs(dy)
+            phi_z = z_surface - node_z
 
-            cone_constraints = z_required - pt_z
+            # Positive only when inside x slab, inside y slab, and below surface.
+            # Therefore feasible/safe is constraint <= 0.
+            slab_violation = smooth_min3(phi_x, phi_y, phi_z)
 
-            cone_constraints = jnp.where(
-                radial_dist <= cone_radius,
-                cone_constraints,
-                -1.0,
-            )
-
-            obstacle_constraints.append(cone_constraints)
+            obstacle_constraints.append(slab_violation)
 
         obstacle_constraints = jnp.concatenate(obstacle_constraints)
 
@@ -471,6 +677,58 @@ def make_control_and_obstacle_constraints(
         )
 
     return constraints
+
+def add_parabolic_wall(
+    server,
+    x_center=0.0,
+    y_center=0.0,
+    z_base=0.0,
+    radius_x=0.1,
+    width_y=0.3,
+    height=0.15,
+    color=(255, 0, 0),
+    name="/parabolic_wall",
+):
+    """
+    Smooth parabolic wall extruded along y.
+
+    Surface:
+        z = z_base + height * (1 - (x/radius_x)^2)
+
+    for |x| <= radius_x
+    and |y| <= width_y / 2
+    """
+
+    xs = np.linspace(-radius_x, radius_x, 160)
+    ys = np.linspace(-width_y / 2.0, width_y / 2.0, 80)
+
+    pts = []
+
+    for x in xs:
+        z = z_base + height * (
+            1.0 - (x / radius_x) ** 2
+        )
+
+        for y in ys:
+            pts.append([
+                x_center + x,
+                y_center + y,
+                z,
+            ])
+
+    pts = np.asarray(pts, dtype=np.float32)
+
+    colors = np.tile(
+        np.array(color, dtype=np.uint8)[None, :],
+        (pts.shape[0], 1),
+    )
+
+    server.scene.add_point_cloud(
+        name=name,
+        points=pts,
+        colors=colors,
+        point_size=0.003,
+    )
 
 class RopeStateSolverNode(Node):
     def __init__(self):
@@ -497,7 +755,7 @@ class RopeStateSolverNode(Node):
         self.cone_obstacle_x_center = 0.05
         self.cone_obstacle_y_center = 0.0
         self.cone_obstacle_z_base = 0.0
-        self.cone_obstacle_height = 0.15
+        self.cone_obstacle_height = 0.3
         self.cone_obstacle_radius = 0.1
         self.cone_obstacle_clearance = 0.03
 
@@ -591,7 +849,7 @@ class RopeStateSolverNode(Node):
         # Goal Right EE: x=-0.13, y=-0.38, z=0.12
         # right ee end: -0.15, -0.35, z=0.18
         x_coords = jnp.ones(self.env.params.num_nodes) * -0.13
-        z_coords = jnp.ones(self.env.params.num_nodes) * 0.15
+        z_coords = jnp.ones(self.env.params.num_nodes) * 0.1
 
         nodes = jnp.stack(
             (
@@ -603,20 +861,43 @@ class RopeStateSolverNode(Node):
         )
         self.state_goals.append(self.env.state(x_node=nodes))
 
+        print(self.state_goals[1])
+
         vmax = 0.2
         u_max = jnp.array([vmax, vmax, vmax, 10.0])
+        u_min = jnp.array([-vmax, -vmax, -vmax, -10.0])
         self.u_max = jnp.repeat(u_max, 2)
-
+        self.u_min = jnp.repeat(u_min, 2)
+        # self.constraints = make_control_and_obstacle_constraints(
+        #     env=self.env,
+        #     u_min=self.u_min,
+        #     u_max=self.u_max,
+        #     cone_centers_xy=jnp.array([
+        #         [self.cone_obstacle_x_center,
+        #         self.cone_obstacle_y_center]
+        #     ]),
+        #     cone_radius=self.cone_obstacle_radius,
+        #     cone_z_top=self.cone_obstacle_height,
+        # )
         self.constraints = make_control_and_obstacle_constraints(
             env=self.env,
-            u_min=-self.u_max,
+            u_min=self.u_min,
             u_max=self.u_max,
-            cone_centers_xy=jnp.array([
-                [self.cone_obstacle_x_center,
-                self.cone_obstacle_y_center]
+
+            obstacle_centers_xy=jnp.array([
+                [
+                    self.cone_obstacle_x_center,
+                    self.cone_obstacle_y_center,
+                ]
             ]),
-            cone_radius=self.cone_obstacle_radius,
-            cone_z_top=self.cone_obstacle_height,
+
+            parabola_radius_x=self.cone_obstacle_radius,
+            parabola_width_y=0.20,          # total width along y
+            parabola_height=self.cone_obstacle_height,
+
+            z_base=0.0,
+
+            tau=1e-2,                       # smoothness
         )
 
         self.sub = self.create_subscription(
@@ -759,7 +1040,7 @@ class RopeStateSolverNode(Node):
             q = jnp.ones_like(state_err[:-6])
 
             # rope node coordinates are interleaved [x, y, z]
-            q = q.at[0::3].set(1.0)   # x weight
+            q = q.at[0::3].set(2.0)   # x weight
             q = q.at[1::3].set(1.0)    # y weight
             q = q.at[2::3].set(1.0)    # z weight
 
@@ -776,13 +1057,13 @@ class RopeStateSolverNode(Node):
             eps_abs=5e-2,
             eps_rel=1e-2,
             rho_max=1e3,
-            max_iterations=100,
+            max_iterations=400,
             rho_update_frequency=25,
             initial_rho=10.0,
         )
 
         sls_cfg = gpu_sls.SLSConfig(
-            max_sls_iterations=2,
+            max_sls_iterations=1,
             sls_primal_tol=1e-2,
             enable_fastsls=False,
             initialize_nominal=True,
@@ -809,7 +1090,7 @@ class RopeStateSolverNode(Node):
         )
 
         disturbance = make_constant_disturbance(
-            alpha=0.003 * self.dt,
+            alpha=0.03 * self.dt,
         )
 
         nc = self.constraints(self.state, self.control0, 0.0).size
@@ -832,6 +1113,26 @@ class RopeStateSolverNode(Node):
 
         self.get_logger().info("Initialized MPC controller.")
 
+    # def closest_point_on_rope_segments(self, points, p):
+    #     points = np.asarray(points, dtype=np.float32)
+    #     p = np.asarray(p, dtype=np.float32)
+
+    #     a = points[:-1]
+    #     b = points[1:]
+    #     ab = b - a
+
+    #     ab_len2 = np.sum(ab * ab, axis=1)
+    #     ap = p[None, :] - a
+
+    #     t = np.sum(ap * ab, axis=1) / np.maximum(ab_len2, 1e-12)
+    #     t = np.clip(t, 0.0, 1.0)
+
+    #     closest = a + t[:, None] * ab
+    #     dists = np.linalg.norm(closest - p[None, :], axis=1)
+
+    #     seg_idx = int(np.argmin(dists))
+    #     return float(dists[seg_idx]), seg_idx, float(t[seg_idx]), closest[seg_idx]
+
     def closest_point_on_rope_segments(self, points, p):
         points = np.asarray(points, dtype=np.float32)
         p = np.asarray(p, dtype=np.float32)
@@ -847,10 +1148,18 @@ class RopeStateSolverNode(Node):
         t = np.clip(t, 0.0, 1.0)
 
         closest = a + t[:, None] * ab
-        dists = np.linalg.norm(closest - p[None, :], axis=1)
+
+        # Only compare z-distance
+        dists = np.abs(closest[:, 2] - p[2])
 
         seg_idx = int(np.argmin(dists))
-        return float(dists[seg_idx]), seg_idx, float(t[seg_idx]), closest[seg_idx]
+
+        return (
+            float(dists[seg_idx]),
+            seg_idx,
+            float(t[seg_idx]),
+            closest[seg_idx],
+        )
 
     def visualize_rollouts(
         self,
@@ -865,33 +1174,46 @@ class RopeStateSolverNode(Node):
         # clear previous debug rollout objects
         self.server.scene.reset()
 
-        rs = np.linspace(0.0, self.cone_obstacle_radius, 30)
-        thetas = np.linspace(0.0, 2.0 * np.pi, 80)
+        # rs = np.linspace(0.0, self.cone_obstacle_radius, 30)
+        # thetas = np.linspace(0.0, 2.0 * np.pi, 80)
 
-        obstacle_pts = []
+        # obstacle_pts = []
 
-        for r in rs:
-            z = self.cone_obstacle_z_base + self.cone_obstacle_height * (
-                1.0 - r / max(self.cone_obstacle_radius, 1e-8)
-            )
+        # for r in rs:
+        #     z = self.cone_obstacle_z_base + self.cone_obstacle_height * (
+        #         1.0 - r / max(self.cone_obstacle_radius, 1e-8)
+        #     )
 
-            for theta in thetas:
-                x = self.cone_obstacle_x_center + r * np.cos(theta)
-                y = self.cone_obstacle_y_center + r * np.sin(theta)
-                obstacle_pts.append([x, y, z])
+        #     for theta in thetas:
+        #         x = self.cone_obstacle_x_center + r * np.cos(theta)
+        #         y = self.cone_obstacle_y_center + r * np.sin(theta)
+        #         obstacle_pts.append([x, y, z])
 
-        obstacle_pts = np.asarray(obstacle_pts, dtype=np.float32)
+        # obstacle_pts = np.asarray(obstacle_pts, dtype=np.float32)
 
-        self.server.scene.add_point_cloud(
-            name="/cone_obstacle",
-            points=obstacle_pts,
-            colors=np.tile(
-                np.array([[255, 80, 80]], dtype=np.uint8),
-                (obstacle_pts.shape[0], 1),
-            ),
-            point_size=0.01,
+        # self.server.scene.add_point_cloud(
+        #     name="/cone_obstacle",
+        #     points=obstacle_pts,
+        #     colors=np.tile(
+        #         np.array([[255, 80, 80]], dtype=np.uint8),
+        #         (obstacle_pts.shape[0], 1),
+        #     ),
+        #     point_size=0.01,
+        # )
+
+        add_parabolic_wall(
+            self.server,
+            x_center=self.cone_obstacle_x_center,
+            y_center=self.cone_obstacle_y_center,
+            z_base=0.0,
+
+            radius_x=self.cone_obstacle_radius,
+            width_y=0.20,
+            height=self.cone_obstacle_height,
+
+            color=(255, 100, 100),
+            name="/obstacle",
         )
-
         # keep ground
         _ = self.server.scene.add_grid(name="ground")
 
@@ -1209,7 +1531,7 @@ class RopeStateSolverNode(Node):
             self.get_logger().info(
                 "Initialized state from first rope state and real gripper pose."
             )
-
+        self.get_logger().info(f"CURRENT STATE {self.state}")
         if self.state_goals[0] is None:
             nodes_goal = jnp.asarray(sampled)
             nodes_goal = nodes_goal.at[:, 2].set(0.05)
@@ -1240,6 +1562,11 @@ class RopeStateSolverNode(Node):
                             grip_positions=grip_positions,
                         )
 
+            sampled = project_rope_to_gripper_vertical_plane(
+                sampled_points=sampled,
+                grip_positions=grip_positions,
+            )
+
             sampled = resample_fixed_spacing(
                 sampled,
                 num_points=self.env.params.num_nodes,
@@ -1251,10 +1578,10 @@ class RopeStateSolverNode(Node):
                 grip_positions=grip_positions,
             )
             
-            alpha = 0.7
-            if self.prev_sampled is not None:
-                sampled = alpha * self.prev_sampled + (1.0 - alpha) * sampled
-            self.prev_sampled = sampled.copy()
+            # alpha = 0.7
+            # if self.prev_sampled is not None:
+            #     sampled = alpha * self.prev_sampled + (1.0 - alpha) * sampled
+            # self.prev_sampled = sampled.copy()
 
             sampled_jnp = jnp.asarray(sampled)
             
@@ -1354,70 +1681,89 @@ class RopeStateSolverNode(Node):
 
         U_sol.block_until_ready()
 
-        solve_converged = (out[-1] < 399)
+        solve_converged = out[-1]
+        self.get_logger().info(f"{solve_converged}")
 
+        constraint_vals = self.constraints(
+            self.state,
+            self.control0,
+            0.0,
+        )
+
+        constraint_vals_np = np.asarray(constraint_vals)
+
+        self.get_logger().info("\n================ CONSTRAINT VALUES ================")
+        self.get_logger().info(f"{constraint_vals_np}")
+
+        print("===================================================\n")
+
+        U = U_sol
+        X = X_sol
         if solve_converged:
-            U = U_sol
-            X = X_sol
-            U_shift = jnp.concatenate(
-                [
-                    U_sol[1:],
-                    U_sol[-1:],
-                ],
-                axis=0,
-            )
+            pass
+            # U = U_sol
+            # X = X_sol
+            # U_shift = jnp.concatenate(
+            #     [
+            #         U_sol[1:],
+            #         U_sol[-1:],
+            #     ],
+            #     axis=0,
+            # )
 
-            # Shift states forward.
-            X_shift = jnp.concatenate(
-                [
-                    X_sol[1:],
-                    X_sol[-1:],
-                ],
-                axis=0,
-            )
-            self.prev_U_solved = U_sol
-            self.prev_X_solved = X_sol
-        else:
-            if self.prev_U_solved is None:
-                self.get_logger().warn("No previous solved trajectory.")
-                return
+            # # Shift states forward.
+            # X_shift = jnp.concatenate(
+            #     [
+            #         X_sol[1:],
+            #         X_sol[-1:],
+            #     ],
+            #     axis=0,
+            # )
+            # self.prev_U_solved = U_sol
+            # self.prev_X_solved = X_sol
+        elif self.in_contact and not solve_converged:
+            # if self.prev_U_solved is None:
+            #     self.get_logger().warn("No previous solved trajectory.")
+            #     return
 
-            # Use stored fallback.
-            U = self.prev_U_solved
-            X = self.prev_X_solved
+            # # Use stored fallback.
+            # U = self.prev_U_solved
+            # X = self.prev_X_solved
 
-            # Shift forward for next iteration.
-            U_shift = jnp.concatenate(
-                [
-                    U[1:],
-                    U[-1:],
-                ],
-                axis=0,
-            )
+            # # Shift forward for next iteration.
+            # U_shift = jnp.concatenate(
+            #     [
+            #         U[1:],
+            #         U[-1:],
+            #     ],
+            #     axis=0,
+            # )
 
-            X_shift = jnp.concatenate(
-                [
-                    X[1:],
-                    X[-1:],
-                ],
-                axis=0,
-            )
+            # X_shift = jnp.concatenate(
+            #     [
+            #         X[1:],
+            #         X[-1:],
+            #     ],
+            #     axis=0,
+            # )
 
-            # Re-anchor initial state.
-            X_shift = X_shift.at[0].set(self.state)
+            # # Re-anchor initial state.
+            # X_shift = X_shift.at[0].set(self.state)
 
-            self.prev_U_solved = U_shift
-            self.prev_X_solved = X_shift
+            # self.prev_U_solved = U_shift
+            # self.prev_X_solved = X_shift
 
             # Also use shifted version as warm start.
             self.controller.U0 = jnp.tile(self.control0[None, :], (self.N, 1))
             self.controller.X0 = jnp.tile(self.state[None, :], (self.N + 1, 1))
+            # self.get_logger().info("Failed solve, retrying")
+            # return
 
         # Force first state to match current measured state.
-        X_shift = X_shift.at[0].set(self.state)
+        # X_shift = X_shift.at[0].set(self.state)
 
-        self.prev_U_solved = U_shift
-        self.prev_X_solved = X_shift
+        # self.prev_U_solved = U_shift
+        # self.prev_X_solved = X_shift
         # ==========================================================
         # Debug rollout visualization
         # ==========================================================
@@ -1486,7 +1832,7 @@ class RopeStateSolverNode(Node):
         callback_time = time.time() - callback_start
 
         self.get_logger().info("=" * 80)
-
+        self.get_logger().info(f"ITERATION NUMBER: {self.num_iterations}")
         self.get_logger().info(
             f"LEFT goal pose: "
             f"x={self.ee_base_frame_left.pose.position.x + left_control[0] * self.dt:.4f} "
@@ -1528,7 +1874,7 @@ class RopeStateSolverNode(Node):
         self.get_logger().info(f"control_right: {right_control}")
 
         self.get_logger().info("=" * 80)
-        # time.sleep(1.0)
+        time.sleep(1.0)
 
 
 def main(args=None):
