@@ -40,7 +40,7 @@ class SingleCameraSAMClothGridNode(Node):
             "/home/jeffreyfang/deformables_ws/src/perception/checkpoints/sam3.pt",
         )
         self.declare_parameter("sam_prompt", "cloth")
-        self.declare_parameter("sam_confidence_threshold", 0.35)
+        self.declare_parameter("sam_confidence_threshold", 0.05)
         self.declare_parameter("run_sam_every_frame", True)
         self.declare_parameter("resize_width", 384)
         self.declare_parameter("target_hz", 10.0)
@@ -827,7 +827,7 @@ class SingleCameraSAMClothGridNode(Node):
         z = points[:, 2]
         y = points[:, 1]
 
-        table_band = max(0.04, 0.35 * spacing)
+        table_band = max(0.05, 0.35 * spacing)
         table_mask = np.abs(z - table_z) <= table_band
 
         if np.count_nonzero(table_mask) < 10:
@@ -917,7 +917,6 @@ class SingleCameraSAMClothGridNode(Node):
             )
 
         center_xz = remove_duplicate_xz(center_xz)
-        # center_xz = upright_path
         if center_xz is None or len(center_xz) < 2:
             return None
 
@@ -926,6 +925,13 @@ class SingleCameraSAMClothGridNode(Node):
 
         if row_xz is None:
             return None
+        
+        if have_ee:
+            ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
+            ee_xz = np.array([ee_mid[0], ee_mid[2]], dtype=np.float32)
+
+            # Put the final cloth-length row exactly at the grippers.
+            row_xz[-1] = ee_xz
 
         if have_ee:
             ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
