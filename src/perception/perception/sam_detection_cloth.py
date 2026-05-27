@@ -88,6 +88,10 @@ class SingleCameraSAMClothGridNode(Node):
         self.declare_parameter("body_translation_y", 0.0)
         self.declare_parameter("body_translation_z", 0.29)
 
+        self.declare_parameter("body_rotation_roll_deg", 0.0)
+        self.declare_parameter("body_rotation_pitch_deg", 0.0)
+        self.declare_parameter("body_rotation_yaw_deg", 0.0)
+
         self.sam_checkpoint_path = str(self.get_parameter("sam_checkpoint_path").value)
         self.sam_prompt = str(self.get_parameter("sam_prompt").value)
         self.sam_confidence_threshold = float(
@@ -135,6 +139,10 @@ class SingleCameraSAMClothGridNode(Node):
         self.body_translation_x = float(self.get_parameter("body_translation_x").value)
         self.body_translation_y = float(self.get_parameter("body_translation_y").value)
         self.body_translation_z = float(self.get_parameter("body_translation_z").value)
+
+        self.body_rotation_roll_deg = float(self.get_parameter("body_rotation_roll_deg").value)
+        self.body_rotation_pitch_deg = float(self.get_parameter("body_rotation_pitch_deg").value)
+        self.body_rotation_yaw_deg = float(self.get_parameter("body_rotation_yaw_deg").value)
 
         self.add_on_set_parameters_callback(self.parameter_callback)
 
@@ -308,10 +316,40 @@ class SingleCameraSAMClothGridNode(Node):
                     self.body_translation_z = float(param.value)
                 elif param.name == "output_frame_id":
                     self.output_frame_id = str(param.value)
+                elif param.name == "body_rotation_roll_deg":
+                    self.body_rotation_roll_deg = float(param.value)
+                elif param.name == "body_rotation_pitch_deg":
+                    self.body_rotation_pitch_deg = float(param.value)
+                elif param.name == "body_rotation_yaw_deg":
+                    self.body_rotation_yaw_deg = float(param.value)
 
             return SetParametersResult(successful=True)
         except Exception as e:
             return SetParametersResult(successful=False, reason=str(e))
+
+    def euler_rotation_matrix_deg(self, roll_deg, pitch_deg, yaw_deg):
+        r = np.deg2rad(float(roll_deg))
+        p = np.deg2rad(float(pitch_deg))
+        y = np.deg2rad(float(yaw_deg))
+
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+
+        Rx = np.array([[1, 0, 0],
+                    [0, cr, -sr],
+                    [0, sr, cr]], dtype=np.float32)
+
+        Ry = np.array([[cp, 0, sp],
+                    [0, 1, 0],
+                    [-sp, 0, cp]], dtype=np.float32)
+
+        Rz = np.array([[cy, -sy, 0],
+                    [sy, cy, 0],
+                    [0, 0, 1]], dtype=np.float32)
+
+        # yaw-pitch-roll / ZYX convention
+        return Rz @ Ry @ Rx
 
     def camera_info_callback(self, msg):
         self.fx = float(msg.k[0])
@@ -612,6 +650,14 @@ class SingleCameraSAMClothGridNode(Node):
         points_body[:, 1] += self.body_translation_y
         points_body[:, 2] += self.body_translation_z
 
+        R = self.euler_rotation_matrix_deg(
+            self.body_rotation_roll_deg,
+            self.body_rotation_pitch_deg,
+            self.body_rotation_yaw_deg,
+        )
+
+        points_body = points_body @ R.T
+
         return points_body
 
     def observed_points_from_depth(self, depth_img, depth_encoding):
@@ -730,6 +776,47 @@ class SingleCameraSAMClothGridNode(Node):
                     row_xz[i] = path_xz[-1]
 
             return row_xz
+
+        def resample_path_from_end_exact(path_xz, n, spacing, end_xz):
+            path_xz = remove_duplicate_xz(path_xz)
+            if path_xz is None or len(path_xz) < 2:
+                return None
+
+            end_xz = np.asarray(end_xz, dtype=np.float32)
+
+            if np.linalg.norm(path_xz[-1] - end_xz) > 1e-6:
+                path_xz = np.vstack([path_xz, end_xz])
+
+            rev = remove_duplicate_xz(path_xz[::-1])
+            if rev is None or len(rev) < 2:
+                return None
+
+            out_rev = [end_xz.copy()]
+            cur = end_xz.copy()
+
+            seg_idx = 0
+            seg = np.diff(rev, axis=0)
+            seg_len = np.linalg.norm(seg, axis=1)
+
+            direction = seg[0] / max(float(seg_len[0]), 1e-6)
+            remain_on_seg = float(seg_len[0])
+
+            while len(out_rev) < n:
+                need = float(spacing)
+
+                while need > remain_on_seg and seg_idx < len(seg_len) - 1:
+                    cur = rev[seg_idx + 1].copy()
+                    need -= remain_on_seg
+
+                    seg_idx += 1
+                    direction = seg[seg_idx] / max(float(seg_len[seg_idx]), 1e-6)
+                    remain_on_seg = float(seg_len[seg_idx])
+
+                cur = cur + direction * need
+                remain_on_seg = max(0.0, remain_on_seg - need)
+                out_rev.append(cur.copy())
+
+            return np.asarray(out_rev[::-1], dtype=np.float32)
 
         def fit_table_path(table_points):
             if table_points.shape[0] < 5:
@@ -917,21 +1004,26 @@ class SingleCameraSAMClothGridNode(Node):
             )
 
         center_xz = remove_duplicate_xz(center_xz)
+
         if center_xz is None or len(center_xz) < 2:
             return None
 
-        row_s = np.arange(n, dtype=np.float32) * spacing
-        row_xz = resample_path(center_xz, row_s)
-
-        if row_xz is None:
-            return None
-        
         if have_ee:
             ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
             ee_xz = np.array([ee_mid[0], ee_mid[2]], dtype=np.float32)
 
-            # Put the final cloth-length row exactly at the grippers.
-            row_xz[-1] = ee_xz
+            row_xz = resample_path_from_end_exact(
+                center_xz,
+                n,
+                spacing,
+                ee_xz,
+            )
+        else:
+            row_s = np.arange(n, dtype=np.float32) * spacing
+            row_xz = resample_path(center_xz, row_s)
+
+        if row_xz is None:
+            return None
 
         if have_ee:
             ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
