@@ -699,10 +699,8 @@ class SingleCameraSAMClothGridNode(Node):
         def remove_duplicate_xz(path_xz):
             if path_xz is None or len(path_xz) < 2:
                 return path_xz
-
             seg = np.diff(path_xz, axis=0)
-            seg_len = np.linalg.norm(seg, axis=1)
-            keep = seg_len > 1e-6
+            keep = np.linalg.norm(seg, axis=1) > 1e-6
             return np.vstack([path_xz[0], path_xz[1:][keep]]).astype(np.float32)
 
         def path_length(path_xz):
@@ -712,16 +710,11 @@ class SingleCameraSAMClothGridNode(Node):
 
         def resample_path(path_xz, row_s):
             path_xz = remove_duplicate_xz(path_xz)
-
             if path_xz is None or len(path_xz) < 2:
                 return None
 
             seg = np.diff(path_xz, axis=0)
             seg_len = np.linalg.norm(seg, axis=1)
-
-            if len(seg_len) == 0:
-                return None
-
             s = np.concatenate([[0.0], np.cumsum(seg_len)])
             total_len = float(s[-1])
 
@@ -731,7 +724,6 @@ class SingleCameraSAMClothGridNode(Node):
                 if target_s <= total_len:
                     idx = int(np.searchsorted(s, target_s, side="right") - 1)
                     idx = max(0, min(idx, len(seg_len) - 1))
-
                     alpha = float((target_s - s[idx]) / max(seg_len[idx], 1e-6))
                     row_xz[i] = (1.0 - alpha) * path_xz[idx] + alpha * path_xz[idx + 1]
                 else:
@@ -755,107 +747,98 @@ class SingleCameraSAMClothGridNode(Node):
             for i in range(num_bins):
                 hi = bins[i]
                 lo = bins[i + 1]
-
-                if i == num_bins - 1:
-                    mask = (x <= hi) & (x >= lo)
-                else:
-                    mask = (x <= hi) & (x > lo)
+                mask = (x <= hi) & (x >= lo) if i == num_bins - 1 else (x <= hi) & (x > lo)
 
                 if np.count_nonzero(mask) < 4:
                     continue
 
-                bx = float(np.median(x[mask]))
-                bz = float(np.median(z[mask]))
-
-                path.append([bx, bz])
+                path.append([float(np.median(x[mask])), float(np.median(z[mask]))])
 
             if len(path) < 2:
                 return None
 
             path = np.asarray(path, dtype=np.float32)
-
-            # Keep table part flat.
             path[:, 1] = table_z
 
-            # Start at closest-camera / largest workstation x.
             if path[0, 0] < path[-1, 0]:
                 path = path[::-1]
 
             return remove_duplicate_xz(path)
 
-        def fit_upright_path(upright_points, table_end_xz):
+        def fit_upright_path(upright_points, table_end_xz, gripper_z=None):
             if upright_points.shape[0] < 5:
                 return None
 
             x = upright_points[:, 0]
             z = upright_points[:, 2]
 
-            # Sort upright component from low z to high z.
-            z_lo, z_hi = np.percentile(z, [2.0, 98.0])
-            num_bins = max(8, min(40, upright_points.shape[0] // 15))
-            bins = np.linspace(z_lo, z_hi, num_bins + 1)
+            z_lo = float(np.percentile(z, 2.0))
+            z_hi = float(np.percentile(z, 98.0))
 
-            path = []
+            if gripper_z is not None and np.isfinite(gripper_z):
+                z_top = float(gripper_z)
+                z_bottom = min(z_lo, float(table_end_xz[1]))
+            else:
+                z_top = z_hi
+                z_bottom = z_lo
 
-            for i in range(num_bins):
-                lo = bins[i]
-                hi = bins[i + 1]
+            if z_top < z_bottom:
+                z_top, z_bottom = z_bottom, z_top
 
-                if i == num_bins - 1:
-                    mask = (z >= lo) & (z <= hi)
-                else:
-                    mask = (z >= lo) & (z < hi)
-
-                if np.count_nonzero(mask) < 4:
-                    continue
-
-                bx = float(np.median(x[mask]))
-                bz = float(np.median(z[mask]))
-
-                path.append([bx, bz])
-
-            if len(path) < 2:
+            if z_top - z_bottom < 1e-6:
                 return None
 
-            path = np.asarray(path, dtype=np.float32)
+            z_targets = list(np.arange(z_top, z_bottom, -spacing, dtype=np.float32))
 
-            # Make upright path start near the table end / bend.
-            d_start = np.linalg.norm(path[0] - table_end_xz)
-            d_end = np.linalg.norm(path[-1] - table_end_xz)
+            if len(z_targets) == 0 or abs(float(z_targets[-1]) - z_bottom) > 0.35 * spacing:
+                z_targets.append(np.float32(z_bottom))
 
-            if d_end < d_start:
-                path = path[::-1]
+            path_top_down = []
+            half_band = 0.5 * spacing
+            min_points_per_band = 4
+
+            for z_target in z_targets:
+                z_target = float(z_target)
+
+                mask = np.abs(z - z_target) <= half_band
+
+                if np.count_nonzero(mask) < min_points_per_band:
+                    mask = np.abs(z - z_target) <= spacing
+
+                if np.count_nonzero(mask) >= min_points_per_band:
+                    bx = float(np.median(x[mask]))
+                else:
+                    k = min(max(min_points_per_band, 8), upright_points.shape[0])
+                    nearest = np.argsort(np.abs(z - z_target))[:k]
+                    bx = float(np.median(x[nearest]))
+
+                path_top_down.append([bx, z_target])
+
+            if len(path_top_down) < 2:
+                return None
+
+            path = np.asarray(path_top_down[::-1], dtype=np.float32)
+
+            if np.linalg.norm(path[0] - table_end_xz) < spacing:
+                path[0] = table_end_xz
 
             return remove_duplicate_xz(path)
-
-        # ----------------------------------------------------------------------
-        # 1. Split segmented cloth cloud into table cloth and upright cloth.
-        # ----------------------------------------------------------------------
 
         z = points[:, 2]
         y = points[:, 1]
 
-        table_band = max(0.012, 0.35 * spacing)
+        table_band = max(0.04, 0.35 * spacing)
         table_mask = np.abs(z - table_z) <= table_band
 
-        # Fallback if table_z is imperfect.
         if np.count_nonzero(table_mask) < 10:
             low_z = np.percentile(z, 25.0)
             table_mask = z <= low_z
 
-        upright_mask = ~table_mask
-
         table_points = points[table_mask]
-        upright_points = points[upright_mask]
+        upright_points = points[~table_mask]
 
         if table_points.shape[0] < 5:
             return None
-
-        # ----------------------------------------------------------------------
-        # 2. Fit row-center paths separately.
-        #    Table part: flat x-z line on table.
-        #    Upright part: vertical/slanted x-z centerline.
-        # ----------------------------------------------------------------------
 
         table_path = fit_table_path(table_points)
 
@@ -864,10 +847,19 @@ class SingleCameraSAMClothGridNode(Node):
 
         table_end_xz = table_path[-1]
 
-        upright_path = fit_upright_path(upright_points, table_end_xz)
+        have_ee = (
+            self.left_ee_position is not None
+            and self.right_ee_position is not None
+        )
+
+        gripper_z = None
+        if have_ee:
+            ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
+            gripper_z = float(ee_mid[2])
+
+        upright_path = fit_upright_path(upright_points, table_end_xz, gripper_z)
 
         if upright_path is not None and len(upright_path) >= 2:
-            # Connect table path to upright path.
             if np.linalg.norm(upright_path[0] - table_path[-1]) < spacing:
                 center_xz = np.vstack([table_path, upright_path[1:]])
             else:
@@ -875,17 +867,10 @@ class SingleCameraSAMClothGridNode(Node):
         else:
             center_xz = table_path
 
-        have_ee = (
-            self.left_ee_position is not None
-            and self.right_ee_position is not None
-        )
-
         if have_ee:
             ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
             ee_xz = np.array([ee_mid[0], ee_mid[2]], dtype=np.float32)
 
-            # EE grounds the high end of the upright component, but does not need
-            # to lie exactly on a grid node.
             if np.linalg.norm(ee_xz - center_xz[-1]) > 0.25 * spacing:
                 center_xz = np.vstack([center_xz, ee_xz])
 
@@ -893,12 +878,6 @@ class SingleCameraSAMClothGridNode(Node):
 
         if center_xz is None or len(center_xz) < 2:
             return None
-
-        # ----------------------------------------------------------------------
-        # 3. If visible length is short, add folded-behind table segment.
-        #    Missing cloth is assumed folded on top of itself, so geometric
-        #    extension is half the missing cloth length.
-        # ----------------------------------------------------------------------
 
         flat_len = path_length(table_path)
         upright_len = path_length(upright_path) if upright_path is not None else 0.0
@@ -915,11 +894,9 @@ class SingleCameraSAMClothGridNode(Node):
         folded_extension = 0.5 * missing_len
 
         if folded_extension > 1e-4:
-            # Bend point is where table part transitions into upright part.
             bend_xz = table_path[-1].copy()
             bend_xz[1] = table_z
 
-            # Table direction immediately before the upright section.
             table_dir = table_path[-1] - table_path[-2]
             table_norm = float(np.linalg.norm(table_dir))
 
@@ -928,11 +905,9 @@ class SingleCameraSAMClothGridNode(Node):
             else:
                 table_dir = table_dir / table_norm
 
-            # Hidden folded-in part lies flat behind the upright component.
             hidden_xz = bend_xz + table_dir * folded_extension
             hidden_xz[1] = table_z
 
-            # Insert behind the upright, right after the visible table part.
             center_xz = np.vstack(
                 [
                     table_path,
@@ -942,7 +917,7 @@ class SingleCameraSAMClothGridNode(Node):
             )
 
         center_xz = remove_duplicate_xz(center_xz)
-
+        # center_xz = upright_path
         if center_xz is None or len(center_xz) < 2:
             return None
 
@@ -951,12 +926,6 @@ class SingleCameraSAMClothGridNode(Node):
 
         if row_xz is None:
             return None
-
-        # ----------------------------------------------------------------------
-        # Build full 3D grid.
-        # Rows follow fitted x-z centerline.
-        # Columns vary only in y.
-        # ----------------------------------------------------------------------
 
         if have_ee:
             ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
