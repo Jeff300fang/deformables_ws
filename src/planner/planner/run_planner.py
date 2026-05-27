@@ -403,6 +403,41 @@ def project_rope_to_gripper_vertical_plane(sampled_points, grip_positions):
 
     return pts
 
+def add_half_ellipsoid_obstacle(
+    server,
+    x_center=0.0,
+    y_center=0.0,
+    z_base=0.0,
+    radius_x=0.1,
+    radius_y=0.1,
+    height_z=0.3,
+    color=(255, 100, 100),
+    name="/half_ellipsoid_obstacle",
+):
+    us = np.linspace(0.0, np.pi / 2.0, 80)      # upper half only
+    vs = np.linspace(0.0, 2.0 * np.pi, 160)
+
+    pts = []
+
+    for u in us:
+        for v in vs:
+            x = x_center + radius_x * np.sin(u) * np.cos(v)
+            y = y_center + radius_y * np.sin(u) * np.sin(v)
+            z = z_base + height_z * np.cos(u)
+            pts.append([x, y, z])
+
+    pts = np.asarray(pts, dtype=np.float32)
+
+    server.scene.add_point_cloud(
+        name=name,
+        points=pts,
+        colors=np.tile(
+            np.array(color, dtype=np.uint8)[None, :],
+            (pts.shape[0], 1),
+        ),
+        point_size=0.004,
+    )
+
 def make_control_constraints(u_min, u_max):
     def constraints(x, u, t):
         return jnp.concatenate((u - u_max, u_min - u))
@@ -589,42 +624,117 @@ def make_constant_disturbance(alpha):
 
 #     return constraints
 
+# def make_control_and_obstacle_constraints(
+#     env,
+#     u_min: jnp.ndarray,
+#     u_max: jnp.ndarray,
+#     obstacle_centers_xy: jnp.ndarray,
+#     parabola_radius_x: float,
+#     parabola_width_y: float,
+#     parabola_height: float,
+#     z_base: float = 0.0,
+#     tau: float = 1e-3,
+#     eps: float = 1e-6,
+# ):
+#     """
+#     Constraint convention:
+#         constraint <= 0 is feasible.
+
+#     Forbidden parabolic slab:
+#         |x - x_c| <= parabola_radius_x
+#         |y - y_c| <= parabola_width_y / 2
+#         z <= z_base + parabola_height * (1 - ((x - x_c) / parabola_radius_x)^2)
+
+#     The obstacle constraint is positive only inside this forbidden volume.
+#     """
+
+#     def smooth_abs(a):
+#         return jnp.sqrt(a * a + eps * eps)
+
+#     def smooth_min(a, b):
+#         # smooth approximation of min(a, b)
+#         return -tau * jax.nn.logsumexp(
+#             jnp.stack((-a / tau, -b / tau), axis=0),
+#             axis=0,
+#         )
+
+#     def smooth_min3(a, b, c):
+#         return smooth_min(smooth_min(a, b), c)
+
+#     def constraints(x, u, t):
+#         control_constraints = jnp.concatenate((u - u_max, u_min - u))
+
+#         rope_nodes, _, gripper_pos = env.unpack_state(x)
+
+#         left_pos, right_pos = gripper_pos[0], gripper_pos[1]
+
+#         effector_constraints = jnp.array([
+#             -left_pos[1],
+#             right_pos[1],
+#         ])
+
+#         node_x = rope_nodes[:, 0]
+#         node_y = rope_nodes[:, 1]
+#         node_z = rope_nodes[:, 2]
+
+#         obstacle_constraints = []
+
+#         for center_xy in obstacle_centers_xy:
+#             x_c = center_xy[0]
+#             y_c = center_xy[1]
+
+#             dx = node_x - x_c
+#             dy = node_y - y_c
+
+#             z_surface = z_base + parabola_height * (
+#                 1.0 - (dx / parabola_radius_x) ** 2
+#             )
+
+#             # Positive means inside each corresponding part of the forbidden slab.
+#             phi_x = parabola_radius_x - smooth_abs(dx)
+#             phi_y = 0.5 * parabola_width_y - smooth_abs(dy)
+#             phi_z = z_surface - node_z
+
+#             # Positive only when inside x slab, inside y slab, and below surface.
+#             # Therefore feasible/safe is constraint <= 0.
+#             slab_violation = smooth_min3(phi_x, phi_y, phi_z)
+
+#             obstacle_constraints.append(slab_violation)
+
+#         obstacle_constraints = jnp.concatenate(obstacle_constraints)
+
+#         return jnp.concatenate(
+#             (
+#                 control_constraints,
+#                 effector_constraints,
+#                 obstacle_constraints,
+#             )
+#         )
+
+#     return constraints
+
 def make_control_and_obstacle_constraints(
     env,
     u_min: jnp.ndarray,
     u_max: jnp.ndarray,
     obstacle_centers_xy: jnp.ndarray,
-    parabola_radius_x: float,
-    parabola_width_y: float,
-    parabola_height: float,
+    ellipsoid_radius_x: float,
+    ellipsoid_radius_y: float,
+    ellipsoid_height_z: float,
     z_base: float = 0.0,
-    tau: float = 1e-3,
-    eps: float = 1e-6,
 ):
     """
     Constraint convention:
         constraint <= 0 is feasible.
 
-    Forbidden parabolic slab:
-        |x - x_c| <= parabola_radius_x
-        |y - y_c| <= parabola_width_y / 2
-        z <= z_base + parabola_height * (1 - ((x - x_c) / parabola_radius_x)^2)
+    Forbidden obstacle:
+        upper half ellipsoid centered at (x_c, y_c, z_base)
 
-    The obstacle constraint is positive only inside this forbidden volume.
+        ((x-x_c)/rx)^2 + ((y-y_c)/ry)^2 + ((z-z_base)/rz)^2 <= 1
+        and z >= z_base
+
+    The constraint is positive inside the upper half ellipsoid.
     """
-
-    def smooth_abs(a):
-        return jnp.sqrt(a * a + eps * eps)
-
-    def smooth_min(a, b):
-        # smooth approximation of min(a, b)
-        return -tau * jax.nn.logsumexp(
-            jnp.stack((-a / tau, -b / tau), axis=0),
-            axis=0,
-        )
-
-    def smooth_min3(a, b, c):
-        return smooth_min(smooth_min(a, b), c)
 
     def constraints(x, u, t):
         control_constraints = jnp.concatenate((u - u_max, u_min - u))
@@ -632,7 +742,6 @@ def make_control_and_obstacle_constraints(
         rope_nodes, _, gripper_pos = env.unpack_state(x)
 
         left_pos, right_pos = gripper_pos[0], gripper_pos[1]
-
         effector_constraints = jnp.array([
             -left_pos[1],
             right_pos[1],
@@ -648,23 +757,19 @@ def make_control_and_obstacle_constraints(
             x_c = center_xy[0]
             y_c = center_xy[1]
 
-            dx = node_x - x_c
-            dy = node_y - y_c
+            dx = (node_x - x_c) / ellipsoid_radius_x
+            dy = (node_y - y_c) / ellipsoid_radius_y
+            dz = (node_z - z_base) / ellipsoid_height_z
 
-            z_surface = z_base + parabola_height * (
-                1.0 - (dx / parabola_radius_x) ** 2
-            )
+            ellipsoid_value = dx**2 + dy**2 + dz**2
 
-            # Positive means inside each corresponding part of the forbidden slab.
-            phi_x = parabola_radius_x - smooth_abs(dx)
-            phi_y = 0.5 * parabola_width_y - smooth_abs(dy)
-            phi_z = z_surface - node_z
+            # positive inside ellipsoid
+            violation = 1.0 - ellipsoid_value
 
-            # Positive only when inside x slab, inside y slab, and below surface.
-            # Therefore feasible/safe is constraint <= 0.
-            slab_violation = smooth_min3(phi_x, phi_y, phi_z)
+            # only keep upper half; below z_base is safe
+            violation = jnp.where(node_z >= z_base, violation, -1.0)
 
-            obstacle_constraints.append(slab_violation)
+            obstacle_constraints.append(violation)
 
         obstacle_constraints = jnp.concatenate(obstacle_constraints)
 
@@ -804,7 +909,7 @@ class RopeStateSolverNode(Node):
         self.prev_U_solved = None
         self.prev_X_solved = None
 
-        self.N = 30
+        self.N = 50
         self.dt = self.env.params.dt
 
         self.x_grip = None
@@ -883,21 +988,16 @@ class RopeStateSolverNode(Node):
             env=self.env,
             u_min=self.u_min,
             u_max=self.u_max,
-
             obstacle_centers_xy=jnp.array([
                 [
                     self.cone_obstacle_x_center,
                     self.cone_obstacle_y_center,
                 ]
             ]),
-
-            parabola_radius_x=self.cone_obstacle_radius,
-            parabola_width_y=0.20,          # total width along y
-            parabola_height=self.cone_obstacle_height,
-
+            ellipsoid_radius_x=0.10,
+            ellipsoid_radius_y=0.10,
+            ellipsoid_height_z=self.cone_obstacle_height,
             z_base=0.0,
-
-            tau=1e-2,                       # smoothness
         )
 
         self.sub = self.create_subscription(
@@ -1033,14 +1133,14 @@ class RopeStateSolverNode(Node):
 
     def initialize_controller(self):
         def cost(W, reference, x, u, t):
-            state_err = x - reference[:x.shape[-1]]
-            control_err = u - reference[x.shape[-1]:]
+            state_err = x[:-6] - reference[:x.shape[-1] - 6]
+            control_err = u[:-2] - reference[x.shape[-1]:-2]
 
             # state weighting
             q = jnp.ones_like(state_err[:-6])
 
             # rope node coordinates are interleaved [x, y, z]
-            q = q.at[0::3].set(2.0)   # x weight
+            q = q.at[0::3].set(.0)   # x weight
             q = q.at[1::3].set(1.0)    # y weight
             q = q.at[2::3].set(1.0)    # z weight
 
@@ -1201,16 +1301,14 @@ class RopeStateSolverNode(Node):
         #     point_size=0.01,
         # )
 
-        add_parabolic_wall(
+        add_half_ellipsoid_obstacle(
             self.server,
             x_center=self.cone_obstacle_x_center,
             y_center=self.cone_obstacle_y_center,
             z_base=0.0,
-
-            radius_x=self.cone_obstacle_radius,
-            width_y=0.20,
-            height=self.cone_obstacle_height,
-
+            radius_x=0.10,
+            radius_y=0.10,
+            height_z=self.cone_obstacle_height,
             color=(255, 100, 100),
             name="/obstacle",
         )
@@ -1874,7 +1972,7 @@ class RopeStateSolverNode(Node):
         self.get_logger().info(f"control_right: {right_control}")
 
         self.get_logger().info("=" * 80)
-        time.sleep(1.0)
+        time.sleep(0.5)
 
 
 def main(args=None):
