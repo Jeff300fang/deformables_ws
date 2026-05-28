@@ -777,47 +777,6 @@ class SingleCameraSAMClothGridNode(Node):
 
             return row_xz
 
-        def resample_path_from_end_exact(path_xz, n, spacing, end_xz):
-            path_xz = remove_duplicate_xz(path_xz)
-            if path_xz is None or len(path_xz) < 2:
-                return None
-
-            end_xz = np.asarray(end_xz, dtype=np.float32)
-
-            if np.linalg.norm(path_xz[-1] - end_xz) > 1e-6:
-                path_xz = np.vstack([path_xz, end_xz])
-
-            rev = remove_duplicate_xz(path_xz[::-1])
-            if rev is None or len(rev) < 2:
-                return None
-
-            out_rev = [end_xz.copy()]
-            cur = end_xz.copy()
-
-            seg_idx = 0
-            seg = np.diff(rev, axis=0)
-            seg_len = np.linalg.norm(seg, axis=1)
-
-            direction = seg[0] / max(float(seg_len[0]), 1e-6)
-            remain_on_seg = float(seg_len[0])
-
-            while len(out_rev) < n:
-                need = float(spacing)
-
-                while need > remain_on_seg and seg_idx < len(seg_len) - 1:
-                    cur = rev[seg_idx + 1].copy()
-                    need -= remain_on_seg
-
-                    seg_idx += 1
-                    direction = seg[seg_idx] / max(float(seg_len[seg_idx]), 1e-6)
-                    remain_on_seg = float(seg_len[seg_idx])
-
-                cur = cur + direction * need
-                remain_on_seg = max(0.0, remain_on_seg - need)
-                out_rev.append(cur.copy())
-
-            return np.asarray(out_rev[::-1], dtype=np.float32)
-
         def fit_table_path(table_points):
             if table_points.shape[0] < 5:
                 return None
@@ -976,11 +935,13 @@ class SingleCameraSAMClothGridNode(Node):
 
         visible_len = flat_len + upright_len
         expected_total_len = spacing * float(n - 1)
-
         missing_len = max(0.0, expected_total_len - visible_len)
         folded_extension = 0.5 * missing_len
 
-        if folded_extension > 1e-4:
+        def make_center_with_hidden(fold_len):
+            if fold_len <= 1e-4:
+                return center_xz.copy()
+
             bend_xz = table_path[-1].copy()
             bend_xz[1] = table_z
 
@@ -992,16 +953,26 @@ class SingleCameraSAMClothGridNode(Node):
             else:
                 table_dir = table_dir / table_norm
 
-            hidden_xz = bend_xz + table_dir * folded_extension
+            hidden_xz = bend_xz + table_dir * fold_len
             hidden_xz[1] = table_z
 
-            center_xz = np.vstack(
+            return np.vstack(
                 [
                     table_path,
                     hidden_xz[None, :],
                     center_xz[len(table_path):],
                 ]
             )
+
+        center_xz = make_center_with_hidden(folded_extension)
+
+        if folded_extension > 1e-4:
+            total_len = path_length(center_xz)
+            excess_len = max(0.0, total_len - expected_total_len)
+
+            if excess_len > 1e-4:
+                folded_extension = max(0.0, folded_extension - 0.5 * excess_len)
+                center_xz = make_center_with_hidden(folded_extension)
 
         center_xz = remove_duplicate_xz(center_xz)
 
@@ -1012,12 +983,21 @@ class SingleCameraSAMClothGridNode(Node):
             ee_mid = 0.5 * (self.left_ee_position + self.right_ee_position)
             ee_xz = np.array([ee_mid[0], ee_mid[2]], dtype=np.float32)
 
-            row_xz = resample_path_from_end_exact(
-                center_xz,
-                n,
-                spacing,
-                ee_xz,
-            )
+            if np.linalg.norm(center_xz[-1] - ee_xz) > 1e-6:
+                center_xz = np.vstack([center_xz, ee_xz])
+                center_xz = remove_duplicate_xz(center_xz)
+
+            total_len = path_length(center_xz)
+
+            if total_len < 1e-6:
+                return None
+
+            row_s = np.linspace(0.0, total_len, n, dtype=np.float32)
+            row_xz = resample_path(center_xz, row_s)
+
+            if row_xz is not None:
+                row_xz[0] = center_xz[0]
+                row_xz[-1] = ee_xz
         else:
             row_s = np.arange(n, dtype=np.float32) * spacing
             row_xz = resample_path(center_xz, row_s)
