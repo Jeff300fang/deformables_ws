@@ -265,6 +265,54 @@ class SingleCameraSAMClothGridNode(Node):
             10,
         )
 
+        self.spline_pub = self.create_publisher(
+            Marker,
+            "/cloth_grid/fitted_spline",
+            10,
+        )
+
+    def publish_spline_marker(self, dense_xyz):
+        dense_xyz = np.asarray(dense_xyz, dtype=np.float32)
+
+        if dense_xyz.ndim != 2 or dense_xyz.shape[1] != 3:
+            return
+
+        dense_xyz = dense_xyz[np.all(np.isfinite(dense_xyz), axis=1)]
+
+        if dense_xyz.shape[0] < 2:
+            return
+
+        marker = Marker()
+        marker.header.frame_id = self.output_frame_id
+        marker.header.stamp = self.get_clock().now().to_msg()
+
+        marker.ns = "cloth_fitted_spline"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.01  # line thickness in meters
+
+        marker.color.r = 0.0
+        marker.color.g = 0.3
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+
+        marker.points = [
+            Point(
+                x=float(p[0]),
+                y=float(p[1]),
+                z=float(p[2]),
+            )
+            for p in dense_xyz
+        ]
+
+        marker.lifetime.sec = 0
+
+        self.spline_pub.publish(marker)
+
     def left_ee_pose_callback(self, msg):
         self.left_ee_position = np.array(
             [
@@ -1041,9 +1089,571 @@ class SingleCameraSAMClothGridNode(Node):
                 d = points - grid[i, j]
                 observed_mask[i, j] = bool(np.any(np.sum(d * d, axis=1) <= radius2))
 
+
         self.publish_cloth_direction_markers(grid)
 
         return grid, observed_mask
+
+    def fix_grid(self, grid_result, points_3d=None):
+        """Rebuild the cloth grid by fixed Euclidean row spacing along a fitted centerline.
+
+        Behavior:
+        - Uses the input grid row centers as an ordered centerline.
+        - Fits/samples a smooth centerline through those row centers.
+        - If fixed-spacing sampling would put row 0 in front of the original first row,
+        extra length is inserted at the spline bend/knee, not at the gripper endpoint.
+        - The bend/knee is detected as the point of largest direction change.
+        - The final gripper endpoint is not extended upward/past the grippers.
+        """
+        if grid_result is None:
+            return None
+
+        if isinstance(grid_result, tuple):
+            grid = grid_result[0]
+        else:
+            grid = grid_result
+
+        grid = np.asarray(grid, dtype=np.float32)
+
+        if grid.ndim != 3 or grid.shape[2] != 3:
+            return None
+
+        spacing = float(self.cloth_spacing_m)
+
+        if spacing <= 0.0 or grid.shape[0] < 2 or grid.shape[1] < 2:
+            return None
+
+        n_rows = int(grid.shape[0])
+        n_cols = int(grid.shape[1])
+
+        row_centers = np.mean(grid, axis=1).astype(np.float32)
+        finite = np.all(np.isfinite(row_centers), axis=1)
+        row_centers = row_centers[finite]
+
+        if row_centers.shape[0] < 2:
+            return None
+
+        center_xz = row_centers[:, [0, 2]].astype(np.float32)
+        center_y = row_centers[:, 1].astype(np.float32)
+
+        seg = np.diff(center_xz, axis=0)
+        seg_len = np.linalg.norm(seg, axis=1)
+        keep_seg = seg_len > 1e-6
+
+        if not np.any(keep_seg):
+            return None
+
+        keep_pts = np.concatenate([[True], keep_seg])
+        center_xz = center_xz[keep_pts]
+        center_y = center_y[keep_pts]
+
+        if center_xz.shape[0] < 2:
+            return None
+
+        seg = np.diff(center_xz, axis=0)
+        seg_len = np.linalg.norm(seg, axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg_len)]).astype(np.float32)
+        polyline_len = float(s[-1])
+
+        if polyline_len < 1e-6:
+            return None
+
+        def linear_eval(values, targets):
+            values = np.asarray(values, dtype=np.float32)
+            targets = np.asarray(targets, dtype=np.float32)
+            out = np.zeros((len(targets), values.shape[1]), dtype=np.float32)
+
+            for i, target in enumerate(targets):
+                target = float(target)
+
+                if target <= s[0]:
+                    idx = 0
+                elif target >= s[-1]:
+                    idx = len(s) - 2
+                else:
+                    idx = int(np.searchsorted(s, target, side="right") - 1)
+                    idx = max(0, min(idx, len(s) - 2))
+
+                denom = max(float(s[idx + 1] - s[idx]), 1e-6)
+                alpha = float((target - s[idx]) / denom)
+                out[i] = (1.0 - alpha) * values[idx] + alpha * values[idx + 1]
+
+            return out
+
+        dense_count = max(200, 25 * n_rows)
+        dense_param = np.linspace(0.0, polyline_len, dense_count, dtype=np.float32)
+
+        try:
+            from scipy.interpolate import CubicSpline
+
+            if np.any(np.diff(s) <= 1e-6):
+                raise ValueError("centerline arc-length samples are not strictly increasing")
+
+            spline_x = CubicSpline(s, center_xz[:, 0], bc_type="natural")
+            spline_z = CubicSpline(s, center_xz[:, 1], bc_type="natural")
+            spline_y = CubicSpline(s, center_y, bc_type="natural")
+
+            dense_x = spline_x(dense_param).astype(np.float32)
+            dense_z = spline_z(dense_param).astype(np.float32)
+            dense_y = spline_y(dense_param).astype(np.float32)
+
+            base_dense_xyz = np.stack(
+                [dense_x, dense_y, dense_z],
+                axis=1,
+            ).astype(np.float32)
+
+        except Exception as e:
+            self.get_logger().warn(
+                f"fix_grid CubicSpline failed, using linear interpolation: {e}"
+            )
+
+            dense_xz = linear_eval(center_xz, dense_param)
+            dense_y = np.interp(dense_param, s, center_y).astype(np.float32)
+
+            base_dense_xyz = np.stack(
+                [dense_xz[:, 0], dense_y, dense_xz[:, 1]],
+                axis=1,
+            ).astype(np.float32)
+
+        if base_dense_xyz.shape[0] < 3:
+            return None
+
+        def find_bend_index(path_xyz):
+            """Find where the centerline changes direction the most.
+
+            Uses XZ geometry because the bend is in the side profile. Avoids the
+            first and last few samples so the detected bend is not an endpoint.
+            """
+            path_xyz = np.asarray(path_xyz, dtype=np.float32)
+
+            if path_xyz.shape[0] < 5:
+                return max(1, path_xyz.shape[0] // 2)
+
+            xz = path_xyz[:, [0, 2]].astype(np.float32)
+
+            v_prev = xz[1:-1] - xz[:-2]
+            v_next = xz[2:] - xz[1:-1]
+
+            prev_norm = np.linalg.norm(v_prev, axis=1)
+            next_norm = np.linalg.norm(v_next, axis=1)
+
+            valid = (prev_norm > 1e-6) & (next_norm > 1e-6)
+
+            if not np.any(valid):
+                return max(1, path_xyz.shape[0] // 2)
+
+            v_prev_unit = v_prev / np.maximum(prev_norm[:, None], 1e-6)
+            v_next_unit = v_next / np.maximum(next_norm[:, None], 1e-6)
+
+            cosang = np.sum(v_prev_unit * v_next_unit, axis=1)
+            cosang = np.clip(cosang, -1.0, 1.0)
+
+            turn_angle = np.arccos(cosang)
+
+            # Prefer bends near the table/fold, but still mostly use curvature.
+            z_mid = path_xyz[1:-1, 2]
+            table_weight = np.exp(
+                -np.abs(z_mid - float(self.table_z)) / max(2.0 * spacing, 1e-6)
+            )
+
+            score = turn_angle * (0.25 + 0.75 * table_weight)
+
+            # Avoid endpoints.
+            margin = max(3, int(0.05 * path_xyz.shape[0]))
+            score[:margin] = -1.0
+            score[-margin:] = -1.0
+
+            if np.max(score) <= 0.0:
+                return max(1, path_xyz.shape[0] // 2)
+
+            # score index is for path index 1:-1, so add 1.
+            bend_idx = int(np.argmax(score) + 1)
+            bend_idx = max(1, min(bend_idx, path_xyz.shape[0] - 2))
+
+            return bend_idx
+
+        bend_idx = find_bend_index(base_dense_xyz)
+
+        def add_bend_detour(input_dense_xyz, fold_len):
+            """Insert hidden length at the spline bend/knee.
+
+            The original first endpoint and last endpoint stay the same.
+            Extra length is inserted where the path changes direction, usually the
+            table-to-upright transition.
+
+            The detour is mostly horizontal/table-parallel so it does not send the
+            spline above the grippers.
+            """
+            input_dense_xyz = np.asarray(input_dense_xyz, dtype=np.float32)
+
+            if fold_len <= 1e-6 or input_dense_xyz.shape[0] < 3:
+                return input_dense_xyz.copy()
+
+            idx = max(1, min(int(bend_idx), input_dense_xyz.shape[0] - 2))
+
+            p_bend = input_dense_xyz[idx].copy()
+            p_prev = input_dense_xyz[idx - 1].copy()
+            p_next = input_dense_xyz[idx + 1].copy()
+
+            # Use the direction entering the bend, projected onto the table.
+            # This extends the horizontal/fold part instead of extending the
+            # gripper-side tangent upward.
+            detour_dir = p_bend - p_prev
+            detour_dir = detour_dir.astype(np.float32)
+            detour_dir[1] = 0.0
+            detour_dir[2] = 0.0
+
+            detour_norm = float(np.linalg.norm(detour_dir))
+
+            if detour_norm < 1e-6:
+                # Fallback: use outgoing direction projected onto table.
+                detour_dir = p_next - p_bend
+                detour_dir = detour_dir.astype(np.float32)
+                detour_dir[1] = 0.0
+                detour_dir[2] = 0.0
+                detour_norm = float(np.linalg.norm(detour_dir))
+
+            if detour_norm < 1e-6:
+                # Fallback from row-center geometry near the same relative position.
+                row_idx = int(round(idx / max(input_dense_xyz.shape[0] - 1, 1) * (row_centers.shape[0] - 1)))
+                row_idx = max(1, min(row_idx, row_centers.shape[0] - 1))
+
+                detour_dir = row_centers[row_idx] - row_centers[row_idx - 1]
+                detour_dir = detour_dir.astype(np.float32)
+                detour_dir[1] = 0.0
+                detour_dir[2] = 0.0
+                detour_norm = float(np.linalg.norm(detour_dir))
+
+            if detour_norm < 1e-6:
+                # Final fallback. Flip this if your RViz "back" direction is -x.
+                detour_dir = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            else:
+                detour_dir = (detour_dir / detour_norm).astype(np.float32)
+
+            p_detour = p_bend + float(fold_len) * detour_dir
+            p_detour[1] = p_bend[1]
+            p_detour[2] = float(self.table_z)
+
+            return np.vstack(
+                [
+                    input_dense_xyz[: idx + 1],
+                    p_detour[None, :],
+                    input_dense_xyz[idx + 1 :],
+                ]
+            ).astype(np.float32)
+
+        def prepare_dense_geometry(candidate_dense_xyz):
+            """Remove duplicate samples and compute arc-length/tangents."""
+            candidate_dense_xyz = np.asarray(candidate_dense_xyz, dtype=np.float32)
+            candidate_dense_xyz = candidate_dense_xyz[
+                np.all(np.isfinite(candidate_dense_xyz), axis=1)
+            ]
+
+            if candidate_dense_xyz.shape[0] < 2:
+                return None
+
+            dense_seg_len_local = np.linalg.norm(
+                np.diff(candidate_dense_xyz, axis=0),
+                axis=1,
+            )
+            keep_dense_local = np.concatenate([[True], dense_seg_len_local > 1e-7])
+            candidate_dense_xyz = candidate_dense_xyz[keep_dense_local]
+
+            if candidate_dense_xyz.shape[0] < 2:
+                return None
+
+            dense_seg_len_local = np.linalg.norm(
+                np.diff(candidate_dense_xyz, axis=0),
+                axis=1,
+            )
+            dense_arc_local = np.concatenate(
+                [[0.0], np.cumsum(dense_seg_len_local)]
+            ).astype(np.float32)
+
+            spline_len_local = float(dense_arc_local[-1])
+
+            if spline_len_local < 1e-6:
+                return None
+
+            first_ds_local = max(float(dense_arc_local[1] - dense_arc_local[0]), 1e-6)
+            last_ds_local = max(float(dense_arc_local[-1] - dense_arc_local[-2]), 1e-6)
+
+            first_tangent_local = (
+                candidate_dense_xyz[1] - candidate_dense_xyz[0]
+            ) / first_ds_local
+            last_tangent_local = (
+                candidate_dense_xyz[-1] - candidate_dense_xyz[-2]
+            ) / last_ds_local
+
+            first_norm_local = float(np.linalg.norm(first_tangent_local))
+            last_norm_local = float(np.linalg.norm(last_tangent_local))
+
+            if first_norm_local < 1e-6 or last_norm_local < 1e-6:
+                return None
+
+            first_tangent_local = (
+                first_tangent_local / first_norm_local
+            ).astype(np.float32)
+            last_tangent_local = (
+                last_tangent_local / last_norm_local
+            ).astype(np.float32)
+
+            return {
+                "dense_xyz": candidate_dense_xyz.astype(np.float32),
+                "dense_arc": dense_arc_local.astype(np.float32),
+                "spline_len": spline_len_local,
+                "first_tangent": first_tangent_local,
+                "last_tangent": last_tangent_local,
+            }
+
+        geom = prepare_dense_geometry(base_dense_xyz)
+
+        if geom is None:
+            return None
+
+        dense_xyz = geom["dense_xyz"]
+        dense_arc = geom["dense_arc"]
+        spline_len = geom["spline_len"]
+        first_tangent = geom["first_tangent"]
+        last_tangent = geom["last_tangent"]
+
+        def set_current_geometry(candidate_geom):
+            nonlocal dense_xyz, dense_arc, spline_len, first_tangent, last_tangent
+
+            dense_xyz = candidate_geom["dense_xyz"]
+            dense_arc = candidate_geom["dense_arc"]
+            spline_len = candidate_geom["spline_len"]
+            first_tangent = candidate_geom["first_tangent"]
+            last_tangent = candidate_geom["last_tangent"]
+
+        def eval_center_at_arc(target):
+            target = float(target)
+
+            # Temporary negative extrapolation is allowed for bracketing only.
+            # The final accepted grid tries to make sampled_arcs[0] >= 0.
+            if target < 0.0:
+                return (
+                    dense_xyz[0] + target * first_tangent
+                ).astype(np.float32)
+
+            # Do NOT extend beyond the gripper/end endpoint. Extra length is added
+            # at the bend/knee instead.
+            if target > spline_len:
+                return dense_xyz[-1].copy()
+
+            return np.array(
+                [
+                    np.interp(target, dense_arc, dense_xyz[:, 0]),
+                    np.interp(target, dense_arc, dense_xyz[:, 1]),
+                    np.interp(target, dense_arc, dense_xyz[:, 2]),
+                ],
+                dtype=np.float32,
+            )
+
+        def previous_center_at_euclidean_spacing(current_center, current_arc):
+            """Find an earlier arc value whose Euclidean distance is spacing."""
+            high = float(current_arc)
+            low = high - spacing
+
+            def distance_at(arc_value):
+                return float(
+                    np.linalg.norm(eval_center_at_arc(arc_value) - current_center)
+                )
+
+            for _ in range(64):
+                if distance_at(low) >= spacing:
+                    break
+                low -= spacing
+            else:
+                return None, None
+
+            for _ in range(32):
+                mid = 0.5 * (low + high)
+
+                if distance_at(mid) >= spacing:
+                    low = mid
+                else:
+                    high = mid
+
+            sampled_arc = low
+            sampled_center = eval_center_at_arc(sampled_arc).astype(np.float32)
+
+            return sampled_center, sampled_arc
+
+        def sample_grid_from_current_geometry():
+            """Sample rows backward from the current geometry endpoint."""
+            sampled_centers_local = np.zeros((n_rows, 3), dtype=np.float32)
+            sampled_arcs_local = np.zeros(n_rows, dtype=np.float32)
+
+            sampled_centers_local[-1] = eval_center_at_arc(spline_len)
+            sampled_arcs_local[-1] = float(spline_len)
+
+            for row_idx in range(n_rows - 2, -1, -1):
+                center, arc_value = previous_center_at_euclidean_spacing(
+                    sampled_centers_local[row_idx + 1],
+                    sampled_arcs_local[row_idx + 1],
+                )
+
+                if center is None:
+                    return None, None
+
+                sampled_centers_local[row_idx] = center
+                sampled_arcs_local[row_idx] = arc_value
+
+            return sampled_centers_local, sampled_arcs_local
+
+        sampled_centers, sampled_arcs = sample_grid_from_current_geometry()
+
+        if sampled_centers is None:
+            self.get_logger().warn(
+                "fix_grid failed initial sampling from fitted spline"
+            )
+            return None
+
+        chosen_fold_len = 0.0
+        chosen_dense_xyz = dense_xyz.copy()
+
+        # If row 0 goes in front of the original first row, inject length at the
+        # bend/knee until row 0 is at or behind the original first row.
+        if float(sampled_arcs[0]) < -1e-4:
+            low_fold = 0.0
+            high_fold = max(spacing, -float(sampled_arcs[0]))
+
+            best_centers = sampled_centers
+            best_arcs = sampled_arcs
+            best_geom = geom
+            found_valid = False
+
+            for _ in range(64):
+                candidate_dense_xyz = add_bend_detour(
+                    base_dense_xyz,
+                    high_fold,
+                )
+                candidate_geom = prepare_dense_geometry(candidate_dense_xyz)
+
+                if candidate_geom is None:
+                    high_fold += spacing
+                    continue
+
+                set_current_geometry(candidate_geom)
+                candidate_centers, candidate_arcs = sample_grid_from_current_geometry()
+
+                if candidate_centers is not None and float(candidate_arcs[0]) >= 0.0:
+                    best_centers = candidate_centers
+                    best_arcs = candidate_arcs
+                    best_geom = candidate_geom
+                    found_valid = True
+                    break
+
+                high_fold += spacing
+
+            if found_valid:
+                for _ in range(40):
+                    mid_fold = 0.5 * (low_fold + high_fold)
+
+                    candidate_dense_xyz = add_bend_detour(
+                        base_dense_xyz,
+                        mid_fold,
+                    )
+                    candidate_geom = prepare_dense_geometry(candidate_dense_xyz)
+
+                    if candidate_geom is None:
+                        low_fold = mid_fold
+                        continue
+
+                    set_current_geometry(candidate_geom)
+                    candidate_centers, candidate_arcs = sample_grid_from_current_geometry()
+
+                    if candidate_centers is None:
+                        low_fold = mid_fold
+                        continue
+
+                    if float(candidate_arcs[0]) < 0.0:
+                        low_fold = mid_fold
+                    else:
+                        best_centers = candidate_centers
+                        best_arcs = candidate_arcs
+                        best_geom = candidate_geom
+                        high_fold = mid_fold
+
+                set_current_geometry(best_geom)
+                sampled_centers = best_centers
+                sampled_arcs = best_arcs
+                chosen_fold_len = float(high_fold)
+                chosen_dense_xyz = dense_xyz.copy()
+
+            else:
+                self.get_logger().warn(
+                    "fix_grid could not find valid bend detour; using original sample"
+                )
+
+                original_geom = prepare_dense_geometry(base_dense_xyz)
+                if original_geom is not None:
+                    set_current_geometry(original_geom)
+                    chosen_dense_xyz = dense_xyz.copy()
+
+        self.publish_spline_marker(chosen_dense_xyz)
+
+        self.get_logger().info(
+            f"fix_grid arcs: front={float(sampled_arcs[0]):.4f}, "
+            f"back={float(sampled_arcs[-1]):.4f}, "
+            f"spline_len={float(spline_len):.4f}, "
+            f"spacing={float(spacing):.4f}, "
+            f"bend_idx={int(bend_idx)}, "
+            f"bend_detour={float(chosen_fold_len):.4f}"
+        )
+
+        # Preserve the original across-cloth direction.
+        if self.left_ee_position is not None and self.right_ee_position is not None:
+            y_sign = np.sign(self.right_ee_position[1] - self.left_ee_position[1])
+
+            if abs(float(y_sign)) < 1e-6:
+                y_sign = 1.0
+
+            width_dir = np.array([0.0, y_sign, 0.0], dtype=np.float32)
+
+        else:
+            width_vec = np.mean(grid[:, -1, :] - grid[:, 0, :], axis=0)
+            width_norm = float(np.linalg.norm(width_vec))
+
+            if width_norm < 1e-6:
+                width_dir = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            else:
+                width_dir = (width_vec / width_norm).astype(np.float32)
+
+        col_offsets = (
+            np.arange(n_cols, dtype=np.float32) - 0.5 * float(n_cols - 1)
+        ) * spacing
+
+        fixed_grid = np.zeros((n_rows, n_cols, 3), dtype=np.float32)
+
+        for i in range(n_rows):
+            for j in range(n_cols):
+                fixed_grid[i, j] = sampled_centers[i] + width_dir * col_offsets[j]
+
+        if points_3d is None:
+            if isinstance(grid_result, tuple) and len(grid_result) > 1:
+                return fixed_grid, grid_result[1]
+
+            return fixed_grid
+
+        points = np.asarray(points_3d, dtype=np.float32)
+        points = points[np.all(np.isfinite(points), axis=1)]
+
+        observed_mask = np.zeros((n_rows, n_cols), dtype=bool)
+        radius2 = (0.8 * spacing) ** 2
+
+        if points.shape[0] > 0:
+            for i in range(n_rows):
+                for j in range(n_cols):
+                    d = points - fixed_grid[i, j]
+                    observed_mask[i, j] = bool(
+                        np.any(np.sum(d * d, axis=1) <= radius2)
+                    )
+
+        self.publish_cloth_direction_markers(fixed_grid)
+
+        return fixed_grid, observed_mask
 
     def publish_cloud(self, points, header, publisher):
         if points is None or len(points) == 0:
@@ -1127,7 +1737,13 @@ class SingleCameraSAMClothGridNode(Node):
                 self.get_logger().warn("Could not build cloth grid")
                 return
 
-            cloth_grid, observed_mask = grid_result
+            fixed_grid_result = self.fix_grid(grid_result, observed_points)
+
+            if fixed_grid_result is None:
+                self.get_logger().warn("Could not fix cloth grid")
+                return
+
+            cloth_grid, observed_mask = fixed_grid_result
 
             out_header = depth_msg.header
             out_header.frame_id = self.output_frame_id
